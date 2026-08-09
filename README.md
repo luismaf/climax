@@ -29,11 +29,15 @@ second act. The best part is always the *climax*.
 
 ## Install
 
-**Arch (AUR):**
+**One line, any OS:**
 
 ```bash
-yay -S climax
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh)"
 ```
+
+It downloads the latest release binary for your OS/arch into `~/.local/bin`
+and nothing else — no service, no config, no surprises. The systemd user
+service (boot autorun) is always opt-in: `climax --install`.
 
 **Ubuntu / Debian:** grab `climax_<version>_amd64.deb` (or `arm64`) from
 the [releases page](https://github.com/luismaf/climax/releases):
@@ -48,7 +52,8 @@ sudo apt install ./climax_0.4.1_amd64.deb
 cargo install --git https://github.com/luismaf/climax
 ```
 
-No AUR? Any Arch user can build the package straight from this repo:
+**Arch:** the AUR package is on its way; meanwhile any Arch user can build
+straight from this repo:
 
 ```bash
 git clone https://github.com/luismaf/climax && cd climax/packaging/aur
@@ -58,14 +63,13 @@ makepkg -si
 ## Quick start
 
 ```bash
-climax --install-service    # systemd user service, boot autorun
-climax -s                   # the whole picture at a glance
-climax -d                   # turn DELEGATION on (the star)
+climax --install    # systemd user service, boot autorun (explicit, always)
+climax -s           # the whole picture at a glance
+climax -d           # turn DELEGATION on (the star)
 ```
 
-That's it: from now on, before the window closes your agent hands over
-its work; when it opens, everyone resumes. The service logs to
-`journalctl --user -u climax.service -f`.
+Running the daemon never installs anything but the Claude Code hook.
+The service is always your call.
 
 ## Usage
 
@@ -138,7 +142,8 @@ Force a different window (stale hook, several agents, or simulation) with
 ## Uninstall
 
 ```bash
-climax --uninstall-service    # removes the service (the hook keeps working)
+climax --uninstall     # removes the service (the binary stays; the hook keeps working)
+rm ~/.local/bin/climax # remove the binary
 ```
 
 ## License
