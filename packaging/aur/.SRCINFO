@@ -1,5 +1,5 @@
 pkgbase = climax
-pkgdesc = Monitor de cuota de Claude Code: JSON hook + auto-resume sobre herdr (sin tmux)
+pkgdesc = Claude Code quota guard: JSON statusLine hook + auto-resume over herdr (no tmux)
 pkgver = 0.4.0
 pkgrel = 1
 url = https://github.com/luismaf/climax

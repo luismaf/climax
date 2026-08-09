@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# Publica o actualiza climax en el AUR.
-# Requisito: cuenta de aur.archlinux.org + clave SSH configurada para
-# aur@aur.archlinux.org. Uso:
-#   scripts/publish-aur.sh [dir-temporal-aur]
+# Publish or update 'climax' on the AUR.
+# Requires: an AUR account (aur.archlinux.org) + SSH key configured.
+# Usage: scripts/publish-aur.sh [aur-clone-dir]
 set -euo pipefail
 
 AUR_DIR="${1:-$HOME/aur/climax}"
 
 if [ ! -d "$AUR_DIR/.git" ]; then
-    echo "Clonando el repo AUR (primera vez)..."
-    git clone ssh://aur@aur.archlinux.org/climax.git "$AUR_DIR"
-    if [ ! -d "$AUR_DIR/.git" ]; then
-        echo "El nombre 'climax' puede estar ocupado en el AUR: probá 'climax-guard'." >&2
+    echo "==> Cloning AUR repo (first time)..."
+    if ! git clone ssh://aur@aur.archlinux.org/climax.git "$AUR_DIR" 2>/dev/null; then
+        echo "'climax' may already be taken on the AUR — try 'climax-guard' instead." >&2
         exit 1
     fi
 fi
@@ -22,10 +20,11 @@ updpkgsums
 makepkg --printsrcinfo > .SRCINFO
 git add PKGBUILD .SRCINFO
 if git diff --cached --quiet; then
-    echo "Sin cambios: el AUR ya está al día."
+    echo "No changes: the AUR is already up to date."
     exit 0
 fi
 git commit -m "climax $(grep '^pkgver=' PKGBUILD | cut -d= -f2)-$(grep '^pkgrel=' PKGBUILD | cut -d= -f2)"
 git push origin master
-echo "==> Publicado: https://aur.archlinux.org/climax/"
-echo "    Instalar: yay -S climax"
+
+echo "==> Published: https://aur.archlinux.org/climax/"
+echo "    Install: yay -S climax"
