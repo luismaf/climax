@@ -20,13 +20,24 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
-    echo
-    echo "Options:"
-    echo "  -v, --version VERSION   install a specific release instead of latest"
-    echo "  -h, --help              show this help"
-    echo
-    echo "Env: CLIMAX_VERSION, CLIMAX_FORCE (arch|deb|mac|windows|linux), CLIMAX_DRY_RUN=1"
+    cat <<'EOF'
+One-liner install for climax:
+  curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh | bash
+
+Detects your system and picks the right method:
+  Ubuntu/Debian : .deb package via apt
+  Arch          : PKGBUILD via makepkg (the yay way, without needing the AUR)
+  macOS         : release binary into ~/.local/bin
+  Windows       : cargo install --git (needs a Rust toolchain, e.g. rustup)
+  other Linux   : release binary into ~/.local/bin
+
+Options:
+  -v, --version VERSION   install a specific release instead of latest
+  -h, --help              show this help
+
+Env overrides: CLIMAX_VERSION (pin), CLIMAX_FORCE (arch|deb|mac|windows|linux),
+CLIMAX_DRY_RUN=1 (print what would happen, touch nothing).
+EOF
 }
 
 while [ $# -gt 0 ]; do
