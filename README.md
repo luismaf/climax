@@ -35,9 +35,18 @@ second act. The best part is always the *climax*.
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh)"
 ```
 
-It downloads the latest release binary for your OS/arch into `~/.local/bin`
-and nothing else — no service, no config, no surprises. The systemd user
-service (boot autorun) is always opt-in: `climax --install`.
+It detects your system and does the right thing:
+
+| System | What it does |
+| --- | --- |
+| Ubuntu / Debian | installs the `.deb` via `apt` |
+| Arch | builds the PKGBUILD with `makepkg` (the yay way, without needing the AUR) |
+| macOS | puts the release binary in `~/.local/bin` |
+| Windows (git-bash) | `cargo install --git` (needs [rustup](https://rustup.rs)) |
+| any other Linux | release binary in `~/.local/bin` |
+
+Whatever the method, it never adds a service or touches your config — the
+systemd service (boot autorun) is always opt-in with `climax --install`.
 
 **Ubuntu / Debian:** grab `climax_<version>_amd64.deb` (or `arm64`) from
 the [releases page](https://github.com/luismaf/climax/releases):
