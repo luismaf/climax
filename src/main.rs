@@ -3,6 +3,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -176,6 +177,10 @@ struct GuardState {
     /// Ventana para la que ya se avisó que el resets_at quedó viejo
     /// (evita repetir el warn en cada poll).
     warned_stale_reset_at: Option<i64>,
+    /// Destrabado por agente: target → resets_at de la última ventana para
+    /// la que ya se mandó el resume (dedup multi-target).
+    #[serde(default)]
+    woken_targets: HashMap<String, i64>,
 }
 
 // ─────────────────────────────────────────────
@@ -193,8 +198,10 @@ struct RateInfo {
 // ─────────────────────────────────────────────
 const AFTER_HELP: &str = r#"MODOS (son mutuamente excluyentes; sin flags = daemon):
 
-  (sin flags)        Daemon: vigila tu cuota 24/7, avisa antes del bloqueo,
-                     y destraba el agente automáticamente al reset.
+(sin flags)        Daemon: vigila tu cuota 24/7, avisa antes del bloqueo,
+                     y al reset destraba al agente automáticamente. Si hay
+                     varios agentes kind='claude' en herdr, destraba TODOS
+                     (los que ya están working no se tocan).
   --status           Muestra el estado actual (solo lectura, no toca nada).
   --dry-run          Ensayo completo del daemon SIN ejecutar herdr ni
                      enviar prompts (solo simula; sí guarda el state.json).
@@ -211,9 +218,10 @@ CONFIGURACIÓN (se edita con --set; el daemon la recarga solo, hot-reload):
 
   --set delegation_enabled=false   Apaga la delegación a otros agentes
                                    (el auto-resume de tu agente sigue activo).
-  --set herdr_agent_target=w5:p2   Fija el agente/pane de herdr a vigilar.
-                                   Obligatorio si hay 2+ agentes tipo.
-  --set herdr_agent_target=null    Vuelve al auto-detetección (por kind).
+  --set herdr_agent_target=w5:p2   Vigila SOLO ese agente/pane (para
+                                    desambiguar). Sin esto, se vigilan TODOS
+                                    los agentes kind='claude' de herdr.
+  --set herdr_agent_target=null    Vuelve a vigilar TODOS los kind claude.
   --set poll_interval_secs=30      Cadencia de revisión (mínimo 5s).
   --set safety_margin_secs=60      Segundos tras resets_at para destrabar.
   --set forced_resets_at=1786292400  Fuerza la ventana de reset (epoch s):
@@ -233,8 +241,8 @@ EJEMPLOS:
   climax --dry-run                       Ensayo general sin tocar agentes
   climax --install-service               Instalar + arrancar el servicio
   climax --set delegation_enabled=false  Apagar la delegación (en vivo)
-  climax --set herdr_agent_target=w5:p2  Fijar el agente a vigilar
-  climax --status                         Estado actual
+  climax --set herdr_agent_target=null   Vigilar TODOS los agentes claude
+  climax --status                         Estado de cuota y agentes
   climax -c /tmp/mi-config.toml --status  Otra config
 
 NOTAS:
@@ -355,15 +363,17 @@ async fn main() -> Result<()> {
                 HookState::Invalid => "JSON inválido".to_string(),
             }
         );
-        match resolve_target(&config).await {
-            Ok(target) => {
-                println!("herdr_target   : {target}");
-                match get_agent_status(&config, &target).await {
-                    Ok(status) => println!("herdr_status   : {status}"),
-                    Err(e) => println!("herdr_status   : (error: {e:#})"),
+        match resolve_targets(&config).await {
+            Ok(targets) => {
+                println!("herdr_targets  : {}", targets.join(", "));
+                for t in &targets {
+                    match get_agent_status(&config, t).await {
+                        Ok(status) => println!("  {t} : {status}"),
+                        Err(e) => println!("  {t} : (error: {e:#})"),
+                    }
                 }
             }
-            Err(e) => println!("herdr_target   : (no resuelto: {e:#})"),
+            Err(e) => println!("herdr_targets  : (no resuelto: {e:#})"),
         }
         return Ok(());
     }
@@ -426,48 +436,17 @@ async fn main() -> Result<()> {
                 );
                 sleep(wait).await;
 
-                let resumed = if dry_run {
-                    info!("[dry-run] mandaría resume: {}", config.resume_message);
-                    true
-                } else {
-                    match ensure_target(&config, &mut cached_target).await {
-                        Ok(target) => {
-                            info!("Enviando resume a '{}': {}", target, config.resume_message);
-                            match send_to_herdr(
-                                &config,
-                                &target,
-                                &config.resume_message,
-                                None,
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    error!("Error enviando resume: {:#}", e);
-                                    cached_target = None;
-                                    false
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "No se pudo resolver el agente de herdr para el resume: {:#}",
-                                e
-                            );
-                            false
-                        }
+                state.last_hard_limit_reset_at = Some(reset_at);
+                save_state(&config.state_path, &state)?;
+                match resume_targets(&config, &mut state, &mut cached_target, reset_at, dry_run)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Los targets que no se anotaron se reintentan en el
+                        // próximo ciclo (run_once detecta pendientes).
+                        warn!("Resume multi-target incompleto: {:#}", e);
                     }
-                };
-
-                if resumed {
-                    state.last_hard_limit_reset_at = Some(reset_at);
-                    save_state(&config.state_path, &state)?;
-                } else {
-                    // No lo marcamos como manejado: el próximo ciclo va a
-                    // recalcular wait_duration (que da un mínimo de 5s) y
-                    // reintenta, en vez de quedarse colgado para siempre.
-                    warn!("Resume no confirmado; se reintentará en el próximo ciclo.");
                 }
             }
             Err(e) => warn!("Error en ciclo: {:#}", e),
@@ -494,14 +473,30 @@ async fn run_once(
         info.used_pct, info.resets_at, info.hard_limit_hit
     );
 
-    // 1. Hard limit: dormir y resumir
+    // 1. Hard limit: dormir y resumir (todos los targets al reset)
     if info.hard_limit_hit {
         if let Some(reset_at) = info.resets_at {
             if state.last_hard_limit_reset_at == Some(reset_at) {
-                // Resume ya enviado para esta ventana. Si pasó de sobra el
-                // reset y el JSON sigue reportando el bloqueo, el resets_at
-                // del hook está desactualizado (o la ventana se corrió):
-                // lo avisamos UNA vez por proceso y seguimos polleando.
+                // Ventana ya procesada: si quedaron targets sin destrabar
+                // (un envío falló), reintentamos en el próximo ciclo.
+                match resolve_targets(config).await {
+                    Ok(targets) => {
+                        let pending = targets
+                            .iter()
+                            .any(|t| state.woken_targets.get(t) != Some(&reset_at));
+                        if pending {
+                            debug!("Quedan targets pendientes de resume para esta ventana");
+                            return Ok(Action::SleepUntil(reset_at));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("No se pudo listar targets para reintentar resume: {:#}", e)
+                    }
+                }
+
+                // Si pasó de sobra el reset y el resets_at se mantiene igual,
+                // el JSON del hook quedó desactualizado (o la ventana se
+                // corrió): lo avisamos UNA vez por ventana y polleamos.
                 if now - reset_at > (config.safety_margin_secs as i64) + 60
                     && state.warned_stale_reset_at != Some(reset_at)
                 {
@@ -713,13 +708,15 @@ fn parse_agent_list(v: &Value) -> Vec<HerdrAgentEntry> {
         .collect()
 }
 
-/// Resuelve el target de `herdr agent ...` (nombre único o pane_id).
-/// Si `herdr_agent_target` está seteado en el config, se usa directo.
-/// Si no, se lista con `herdr agent list` y se filtra por `herdr_agent_kind`.
-/// Ambigüedad (0 o >1 matches) es un error explícito, no una adivinanza.
-async fn resolve_target(config: &Config) -> Result<String> {
+/// Resuelve los targets de `herdr agent ...` (nombres únicos o pane_ids).
+/// Si `herdr_agent_target` está seteado en el config, se usa DIRECT (solo
+/// ese). Si no, se listan con `herdr agent list` y se filtra por
+/// `herdr_agent_kind`: TODOS los que matcheen son targets (multi-agente:
+/// al reset se despiertan todos; el aviso de delegación va al primero).
+/// Cero matches es un error explícito, no una adivinanza.
+async fn resolve_targets(config: &Config) -> Result<Vec<String>> {
     if let Some(explicit) = &config.herdr_agent_target {
-        return Ok(explicit.clone());
+        return Ok(vec![explicit.clone()]);
     }
 
     let output = herdr_command(config)
@@ -739,13 +736,14 @@ async fn resolve_target(config: &Config) -> Result<String> {
         serde_json::from_slice(&output.stdout).context("parseando JSON de 'herdr agent list'")?;
     let agents = parse_agent_list(&v);
 
-    let matches: Vec<&HerdrAgentEntry> = agents
+    let matches: Vec<String> = agents
         .iter()
         .filter(|a| a.kind.as_deref() == Some(config.herdr_agent_kind.as_str()))
+        .map(|a| a.target.clone())
         .collect();
 
-    match matches.len() {
-        0 => bail!(
+    match matches.as_slice() {
+        [] => bail!(
             "No se encontró ningún agente kind='{}' vivo en herdr. Vistos: {:?}. \
              Seteá herdr_agent_target en el config de climax si el kind detectado no coincide.",
             config.herdr_agent_kind,
@@ -754,13 +752,8 @@ async fn resolve_target(config: &Config) -> Result<String> {
                 .map(|a| format!("{}({})", a.target, a.kind.as_deref().unwrap_or("?")))
                 .collect::<Vec<_>>()
         ),
-        1 => Ok(matches[0].target.clone()),
-        n => bail!(
-            "Hay {} agentes kind='{}' vivos ({:?}). Seteá herdr_agent_target para desambiguar.",
-            n,
-            config.herdr_agent_kind,
-            matches.iter().map(|a| a.target.clone()).collect::<Vec<_>>()
-        ),
+        // Ojo: devolvemos TODOS los que matchean (multi-target), no solo uno.
+        all => Ok(all.to_vec()),
     }
 }
 
@@ -768,10 +761,76 @@ async fn ensure_target(config: &Config, cached: &mut Option<String>) -> Result<S
     if let Some(t) = cached {
         return Ok(t.clone());
     }
-    let t = resolve_target(config).await?;
+    let targets = resolve_targets(config).await?;
+    let t = targets[0].clone();
     info!("Agente objetivo resuelto: {}", t);
     *cached = Some(t.clone());
     Ok(t)
+}
+
+/// Despierta TODOS los targets de herdr cuando se abre la ventana.
+/// - Los que ya están `working` no se tocan (se anotan como ok).
+/// - Los que ya fueron resumidos para este `reset_at` se omiten (dedup).
+/// - Si un envío falla, queda SIN anotar: el próximo ciclo lo reintenta.
+async fn resume_targets(
+    config: &Config,
+    state: &mut GuardState,
+    cached_target: &mut Option<String>,
+    reset_at: i64,
+    dry_run: bool,
+) -> Result<()> {
+    let targets = resolve_targets(config).await?;
+    info!(
+        "Ventana {} abierta: verificando {} target(s)",
+        reset_at,
+        targets.len()
+    );
+
+    for t in &targets {
+        if state.woken_targets.get(t) == Some(&reset_at) {
+            debug!("'{}' ya tiene resume para esta ventana, skip", t);
+            continue;
+        }
+
+        if !dry_run {
+            // No pisamos a un agente que ya está trabajando: primero
+            // chequeamos su estado real. Si no se puede consultar, se manda
+            // igual (más seguro liberar que dejar colgado).
+            match get_agent_status(config, t).await {
+                Ok(s) if s == "working" => {
+                    info!("'{}' ya está working ({}) — no se toca", t, s);
+                    state.woken_targets.insert(t.clone(), reset_at);
+                    continue;
+                }
+                Ok(s) => debug!("'{}' está '{}' → enviando resume", t, s),
+                Err(e) => debug!("No se pudo verificar '{}' ({:#}) → enviando igual", t, e),
+            }
+        }
+
+        let ok = if dry_run {
+            info!(
+                "[dry-run] le mandaría resume a '{}': {}",
+                t, config.resume_message
+            );
+            true
+        } else {
+            info!("Enviando resume a '{}': {}", t, config.resume_message);
+            match send_to_herdr(config, t, &config.resume_message, None, None).await {
+                Ok(_) => true,
+                Err(e) => {
+                    error!("Error enviando resume a '{}': {:#}", t, e);
+                    *cached_target = None;
+                    false
+                }
+            }
+        };
+        if ok {
+            state.woken_targets.insert(t.clone(), reset_at);
+        }
+    }
+
+    save_state(&config.state_path, state)?;
+    Ok(())
 }
 
 /// Envía texto + Enter de forma atómica vía `herdr agent prompt`.
