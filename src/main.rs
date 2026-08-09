@@ -166,6 +166,9 @@ Cuando vuelva el reset (lo va a manejar el guard automáticamente), la primera a
 struct GuardState {
     last_injected_reset_at: Option<i64>,
     last_hard_limit_reset_at: Option<i64>,
+    /// Ventana para la que ya se avisó que el resets_at quedó viejo
+    /// (evita repetir el warn en cada poll).
+    warned_stale_reset_at: Option<i64>,
 }
 
 // ─────────────────────────────────────────────
@@ -185,31 +188,71 @@ struct RateInfo {
 #[command(
     name = "climax",
     version,
-    about = "Claude Code quota guard (JSON hook + auto-resume, orquestado sobre herdr)"
+    about = "Claude Code quota guard (JSON hook + auto-resume, orquestado sobre herdr)",
+    after_help = "EJEMPLOS:
+  climax --status                          Estado actual: % usado, reset, target herdr
+  climax --dry-run                       Ensayo general sin tocar herdr ni los agentes
+  climax --install-service              Instala el servicio systemd (autorun en boot)
+  climax --set delegation_enabled=false  Apaga la delegación (el daemon la toma sola)
+  climax --set herdr_agent_target=w5:p2  Fija a qué agente mandar resume/inyectar
+  climax --set poll_interval_secs=30 --set safety_margin_secs=60
+  climax --set herdr_agent_target=null   Vuelve al autodetección de agentes
+  climax -c /tmp/mi-config.toml --status  Usa otra config
+"
 )]
 struct Cli {
-    #[arg(short, long)]
+    /// Ruta del archivo de configuración TOML.
+    /// Default: ~/.config/climax/config.toml (si no existe, usa defaults).
+    #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Muestra el estado actual y termina: % de cuota usado, si hay hard
+    /// limit, cuándo resetea, estado del hook, y qué agente(s) herdr va a
+    /// usar. No envía nada, no escribe nada.
     #[arg(long)]
     status: bool,
+
+    /// Corre el loop completo PERO en modo simulación: lee el JSON real,
+    /// detecta bloqueos y avisos, pero NO ejecuta herdr ni envía prompts
+    /// (nada llega a tus agentes). Guarda el state.json igual que el modo
+    /// real, para que la ventana simulada no se repita.
+    /// Útil para probar sin correr riesgos.
     #[arg(long)]
     dry_run: bool,
-    /// Modo hook del statusLine de Claude Code: lee el payload JSON que
-    /// Claude Code envía por stdin y lo persiste atómicamente en
-    /// statusline_json_path (default ~/.claude/statusline-cache.json).
-    /// Reemplaza por completo al statusline_writer.sh externo.
-    #[arg(long)]
+
+    /// Modo hook del statusLine de Claude Code: LEE el payload JSON que
+    /// Claude Code envía por stdin y lo ESCRIBE (persiste en
+    /// statusline_json_path, default ~/.claude/statusline-cache.json).
+    /// Se invoca solo, por Claude Code, en cada render (nada manual).
+    /// Escribe con tmp+rename (atómico) para que el daemon nunca lea un
+    /// archivo cortado. No valida la cuota: solo guarda el snapshot.
+    #[arg(long, value_name = "PATH")]
     write_statusline: bool,
+
     /// Instala climax como servicio de usuario de systemd con autorun en
-    /// boot (login + linger) y lo arranca. Idempotente.
+    /// el boot (login + linger) y lo arranca. Copia el binario actual a
+    /// ~/.local/bin y genera ~/.config/systemd/user/climax.service
+    /// apuntándolo para que no dependa de la ubicación del código.
+    /// Reejecutarlo después de un rebuild actualiza el binario del
+    /// servicio y lo reinicia.
     #[arg(long)]
     install_service: bool,
-    /// Detiene, deshabilita y elimina el servicio de systemd.
+
+    /// Detiene, deshabilita y elimina el unit de systemd y el autorun.
+    /// NO borra el binario de ~/.local/bin (el hook del statusLine lo
+    /// sigue usando para el guard).
     #[arg(long)]
     uninstall_service: bool,
-    /// Edita la configuración (crea el archivo si no existe) y termina.
-    /// Formato: --set clave=valor, repetible. El daemon recarga el archivo
-    /// solo cuando cambia (hot-reload, sin reinicio).
+
+    /// Edita la configuración y termina. Setea claves conocidas en el
+    /// archivo de config (default: ~/.config/climax/config.toml,
+    /// creándolo si no existe). Tipos se infieren: true/false → bool,
+    /// números → num, resto → string. 'null' borra la clave.
+    /// El daemon recarga el archivo solo (hot-reload, en el próximo ciclo
+    /// de poll), sin reiniciar. Ejemplos:
+    ///   --set delegation_enabled=false
+    ///   --set herdr_agent_target=w5:p2
+    ///   --set poll_interval_secs=30
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
 }
@@ -429,7 +472,11 @@ async fn run_once(
                 // reset y el JSON sigue reportando el bloqueo, el resets_at
                 // del hook está desactualizado (o la ventana se corrió):
                 // lo avisamos UNA vez por proceso y seguimos polleando.
-                if now - reset_at > (config.safety_margin_secs as i64) + 60 {
+                if now - reset_at > (config.safety_margin_secs as i64) + 60
+                    && state.warned_stale_reset_at != Some(reset_at)
+                {
+                    state.warned_stale_reset_at = Some(reset_at);
+                    save_state(&config.state_path, state)?;
                     warn!(
                         "Resume ya enviado para reset_at={} pero el límite sigue \
                          activo: el resets_at del hook está desactualizado o la \
@@ -552,8 +599,27 @@ struct HerdrAgentEntry {
     kind: Option<String>,
 }
 
+/// Resuelve el binario de herdr a invocar: si `herdr_bin` es una ruta
+/// (absoluta o con /), se usa tal cual. Si es solo un nombre, se busca
+/// primero en ~/.local/bin (los servicios systemd de usuario corren con
+/// un PATH mínimo y no ven los bins de $HOME) y después cae al PATH del
+/// proceso. Devuelve path o nombre, siempre útil para Command::new.
+fn herdr_bin_resolved(config: &Config) -> PathBuf {
+    let bin = Path::new(&config.herdr_bin);
+    if bin.components().count() > 1 {
+        return bin.to_path_buf();
+    }
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join(".local/bin").join(&config.herdr_bin);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    bin.to_path_buf()
+}
+
 fn herdr_command(config: &Config) -> Command {
-    let mut cmd = Command::new(&config.herdr_bin);
+    let mut cmd = Command::new(herdr_bin_resolved(config));
     if let Some(session) = &config.herdr_session {
         cmd.env("HERDR_SESSION", session);
     }
@@ -1193,6 +1259,9 @@ fn install_service() -> Result<()> {
          After=default.target\n\
          \n\
          [Service]\n\
+         # Los servicios de usuario arrancan con un PATH mínimo; sin esto\n\
+         # no encontrarían herdr (ni otras tools de ~/.local/bin).\n\
+         Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
          ExecStart={exe_quoted}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
