@@ -5,13 +5,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+
+// ─────────────────────────────────────────────
+// Colors (only when stdout is a terminal)
+// ─────────────────────────────────────────────
+const GREEN: &str = "\x1b[0;32m";
+const YELLOW: &str = "\x1b[0;33m";
+const RED: &str = "\x1b[0;31m";
+const CYAN: &str = "\x1b[0;36m";
+const RESET: &str = "\x1b[0m";
+
+fn painted(s: &str, code: &str) -> String {
+    if io::stdout().is_terminal() {
+        format!("{code}{s}{RESET}")
+    } else {
+        s.to_string()
+    }
+}
 
 // ─────────────────────────────────────────────
 // Config
@@ -432,13 +449,13 @@ async fn main() -> Result<()> {
 
     if cli.status {
         let info = gather_rate_info(&config)?;
-        print_status(&info);
+        print_status(&info, &config);
         println!(
             "delegation     : {}",
             if config.delegation {
-                "enabled"
+                painted("enabled", GREEN)
             } else {
-                "disabled (default)"
+                painted("disabled (default)", RED)
             }
         );
         if let Some(forced) = config.forced_resets_at {
@@ -450,11 +467,11 @@ async fn main() -> Result<()> {
         println!(
             "statusline_hook: {}",
             match hook_state(&claude_settings_path(&config)) {
-                HookState::Present => "installed".to_string(),
-                HookState::NoSettings => "no settings.json".to_string(),
-                HookState::Missing => "missing (auto-install on daemon start)".to_string(),
-                HookState::Other => "points to another command".to_string(),
-                HookState::Invalid => "invalid JSON".to_string(),
+                HookState::Present => painted("installed", GREEN),
+                HookState::NoSettings => painted("no settings.json", YELLOW),
+                HookState::Missing => painted("missing (auto-install on daemon start)", YELLOW),
+                HookState::Other => painted("points to another command", RED),
+                HookState::Invalid => painted("invalid JSON", RED),
             }
         );
         match resolve_targets(&config).await {
@@ -462,12 +479,23 @@ async fn main() -> Result<()> {
                 println!("herdr_targets  : {}", targets.join(", "));
                 for t in &targets {
                     match get_agent_status(&config, t).await {
-                        Ok(status) => println!("  {t} : {status}"),
-                        Err(e) => println!("  {t} : (error: {e:#})"),
+                        Ok(status) => {
+                            let code = match status.as_str() {
+                                "working" | "busy" => GREEN,
+                                "idle" | "free" | "waiting" => YELLOW,
+                                "queued" | "pending" => CYAN,
+                                _ => RED,
+                            };
+                            println!("  {t} : {}", painted(&status, code));
+                        }
+                        Err(e) => println!("  {t} : {}", painted(&format!("(error: {e:#})"), RED)),
                     }
                 }
             }
-            Err(e) => println!("herdr_targets  : (not resolved: {e:#})"),
+            Err(e) => println!(
+                "herdr_targets  : {}",
+                painted(&format!("(not resolved: {e:#})"), RED)
+            ),
         }
         return Ok(());
     }
@@ -1159,6 +1187,16 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
     Ok(s)
 }
 
+fn toml_inline(v: &toml::Value) -> String {
+    match v {
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::String(s) => format!("'{s}'"),
+        other => other.to_string(),
+    }
+}
+
 /// Escribe los settings en el archivo de config (creándolo si no existe),
 /// con escritura atómica. "null" (None) elimina la clave. El daemon
 /// recarga el archivo por mtime (hot-reload).
@@ -1195,11 +1233,30 @@ fn apply_config_settings(path: &Path, entries: &[(String, Option<toml::Value>)])
 
     for (k, v) in entries {
         match v {
-            Some(value) => println!(
-                "  {k} = {}",
-                toml::to_string(value).unwrap_or_default().trim()
-            ),
-            None => println!("  {k} = (removed)"),
+            Some(value) => println!("  {k} = {}", toml_inline(value)),
+            None => println!("  {k} = {}", painted("(removed)", RED)),
+        }
+    }
+    for (k, v) in entries {
+        if k == "delegation" {
+            match v {
+                Some(toml::Value::Boolean(true)) => {
+                    println!(
+                        "{}",
+                        painted(
+                            "Delegation is now ON (the star; auto-resume keeps working).",
+                            GREEN
+                        )
+                    );
+                }
+                Some(toml::Value::Boolean(false)) => {
+                    println!(
+                        "{}",
+                        painted("Delegation is now OFF (plain auto-resume).", RED)
+                    );
+                }
+                _ => {}
+            }
         }
     }
     println!("Config actualizado en {}", path.display());
@@ -1616,15 +1673,45 @@ fn uninstall_service() -> Result<()> {
     Ok(())
 }
 
-fn print_status(info: &RateInfo) {
-    println!("used_pct       : {:.1}%", info.used_pct);
-    println!("hard_limit     : {}", info.hard_limit_hit);
+fn print_status(info: &RateInfo, config: &Config) {
+    println!(
+        "used_pct       : {}",
+        painted(
+            &format!("{:.1}%", info.used_pct),
+            if info.hard_limit_hit || info.used_pct >= 99.9 {
+                RED
+            } else if info.used_pct >= config.threshold_pct {
+                YELLOW
+            } else {
+                GREEN
+            }
+        )
+    );
+    println!(
+        "hard_limit     : {}",
+        painted(
+            if info.hard_limit_hit {
+                "true (blocked)"
+            } else {
+                "false"
+            },
+            if info.hard_limit_hit { RED } else { GREEN }
+        )
+    );
     if let Some(ts) = info.resets_at {
         let dt = DateTime::from_timestamp(ts, 0)
             .map(|d| d.with_timezone(&Local).to_rfc3339())
             .unwrap_or_default();
+        let remaining = ts - Utc::now().timestamp();
         println!("resets_at      : {} ({})", ts, dt);
-        println!("remaining_secs : {}", ts - Utc::now().timestamp());
+        println!(
+            "remaining_secs : {}",
+            if remaining <= config.warning_lead_time_secs as i64 {
+                painted(&format!("{remaining} (warning in ~{remaining}s)"), YELLOW)
+            } else {
+                remaining.to_string()
+            }
+        );
     } else {
         println!("resets_at      : (desconocido)");
     }
