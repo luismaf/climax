@@ -213,9 +213,15 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = daemon):
                     render; not meant to be run by hand.
   --install-service  Install the systemd user service with boot autorun
                     (copies the binary to ~/.local/bin) and start it.
-  --uninstall-service  Uninstall the service (the binary stays, so the
+--uninstall-service  Uninstall the service (the binary stays, so the
                     statusline hook keeps working).
-  --set KEY=VALUE   Edit the config file and exit (see CONFIGURATION).
+  -d, --delegate    Turn the DELEGATION on (writes the config file).
+  -n, --no-delegate Turn the DELEGATION off (default).
+  -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
+  -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
+  -s, --status      Show current state (read-only, doesn't touch anything).
+  -x, --dry-run     Full daemon rehearsal WITHOUT running herdr or sending
+                    prompts (only simulates; state.json IS still saved).
 
 DELEGATION — the star (OFF by default):
 
@@ -228,45 +234,45 @@ DELEGATION — the star (OFF by default):
        so the work keeps moving without you and without losing context.
 
    It's optional and coexists with auto-resume (which keeps working):
-   one command turns it on, and the prompt text is fully customizable:
 
-     climax --set delegation=true
-     climax --set delegation_prompt='your own prompt'   (custom)
+     climax -d
+     climax --prompt 'your own prompt'   (customize the delegation text)
+     climax -n                          (turn it back off)
 
-CONFIGURATION (edited with --set; the daemon hot-reloads the file):
+CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
 
-  --set delegation=true            Turn the DELEGATION on (see above).
-                                  Off by default — the auto-resume of your
-                                  agent at the reset works the same way.
-  --set herdr_agent_target=w5:p2  Watch ONLY that agent/pane (to
-                                   disambiguate). Without it, ALL the
-                                   kind='claude' agents in herdr are watched.
-  --set herdr_agent_target=null   Back to watching ALL claude kinds.
-  --set poll_interval_secs=30     Check frequency (minimum 5s).
-  --set safety_margin_secs=60     Seconds after resets_at to resume.
-  --set forced_resets_at=1786292400  Force the reset window (epoch s):
-                                   ignores the resets_at from the hook JSON.
-                                   Useful with several agents/windows, a
-                                   stale hook, or to simulate. 'null'
-                                   returns to the hook's window.
-  --set install_statusline_hook=false  Don't auto-install the hook (if you
-                                   already configured it by hand).
-  --set resume_message='seguimos'  Resume text (default: continue).
-  Other keys: threshold_pct, warning_lead_time_secs, herdr_bin,
-  herdr_session, herdr_agent_kind, delegation_prompt, resume_message,
-  state_path, statusline_json_path, claude_settings_path.
+  -d, --delegate            delegation = true    (the star, explicitly)
+  -n, --no-delegate         delegation = false   (default)
+  -t, --target <name>       herdr_agent_target   ("null" → watch ALL
+                            kind='claude' agents; useful to disambiguate).
+      --poll <secs>         poll_interval_secs   (min 5, default 10).
+      --margin <secs>       safety_margin_secs   (default 15, post-reset).
+      --warning <secs>      warning_lead_time_secs (default 300).
+      --threshold <pct>     threshold_pct (85; only when no resets_at).
+      --forced-reset <epoch>  Force the reset window ("null" clears).
+      --herdr <bin>         herdr binary (default: PATH / ~/.local/bin).
+      --session <name>      herdr session ("null" clears).
+      --kind <kind>         herdr_agent_kind (default: claude).
+      --resume-msg <text>   resume_message (default: continue).
+      --prompt <text>       delegation_prompt (custom delegation text).
+      --no-install-hook     don't auto-install the statusLine hook.
+      --state-file <path>   state_path (daemon state, JSON).
+      --statusline <path>   statusline_json_path (hook cache).
+      --settings <path>     claude_settings_path ("null" = default).
 
 EXAMPLES:
   climax                                 Daemon (what the service runs)
-  climax --dry-run                       Rehearsal without touching agents
+  climax -d                              Turn the star on (delegation)
+  climax -t null                          Watch ALL claude agents
+  climax -t w5:p2                        Watch only that agent
+  climax -x                              Rehearsal without touching agents
+  climax -s                              Status (quota + agents)
+  climax -c /tmp/my-config.toml -s       Different config
   climax --install-service               Install + start the service
-  climax --set delegation=true           Turn the star on (delegation)
-  climax --set herdr_agent_target=null   Watch ALL claude agents
-  climax --status                         Current states (quota + agents)
-  climax -c /tmp/my-config.toml --status  Different config
 
 NOTES:
-  - Default config: ~/.config/climax/config.toml (created with --set).
+  - Instead of flags you can edit ~/.config/climax/config.toml by hand
+    (same values; the daemon hot-reloads the file).
   - Service logs: journalctl --user -u climax.service -f
   - Install with a package manager: Arch (AUR): yay -S climax · Ubuntu/Debian: .deb from the release.
 "#;
@@ -284,12 +290,25 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Show status: % used, reset, window, agents (read-only).
-    #[arg(long)]
+    #[arg(short = 's', long)]
     status: bool,
 
     /// Rehearsal: full daemon cycle WITHOUT running herdr or sending prompts.
-    #[arg(long)]
+    #[arg(short = 'x', long)]
     dry_run: bool,
+
+    /// Turn DELEGATION on (writes to the config file, hot-reloaded).
+    #[arg(short = 'd', long)]
+    delegate: bool,
+
+    /// Turn DELEGATION off (default; writes to the config file).
+    #[arg(short = 'n', long)]
+    no_delegate: bool,
+
+    /// Watch ONLY that agent/pane of herdr. "null" clears the pin and
+    /// goes back to watching ALL kind='claude' agents.
+    #[arg(short = 't', long, value_name = "AGENT")]
+    target: Option<String>,
 
     /// statusLine hook for Claude Code: receives JSON on stdin and stores
     /// it in statusline_json_path (the guard reads it afterwards).
@@ -304,10 +323,62 @@ struct Cli {
     #[arg(long)]
     uninstall_service: bool,
 
-    /// Edit the config file (KEY=VALUE, repeatable, auto-typed,
-    /// 'null' deletes the key). See CONFIGURATION above.
-    #[arg(long = "set", value_name = "KEY=VALUE")]
-    set: Vec<String>,
+    /// Check frequency in seconds (minimum 5; default 10).
+    #[arg(long, value_name = "SECS")]
+    poll: Option<u64>,
+
+    /// Seconds after the reset before sending the resume (default 15).
+    #[arg(long, value_name = "SECS")]
+    margin: Option<u64>,
+
+    /// How many seconds before the block to warn (default 300).
+    #[arg(long, value_name = "SECS")]
+    warning: Option<u64>,
+
+    /// Fallback % of usage that triggers the warning when there is no
+    /// resets_at in the hook JSON (default 85).
+    #[arg(long, value_name = "PCT")]
+    threshold: Option<f64>,
+
+    /// Force the reset window (epoch seconds). "null" clears it.
+    #[arg(long, value_name = "EPOCH")]
+    forced_reset: Option<String>,
+
+    /// herdr binary (path or name) to invoke.
+    #[arg(long, value_name = "BIN")]
+    herdr: Option<String>,
+
+    /// Named herdr session (passed as HERDR_SESSION). "null" removes it.
+    #[arg(long, value_name = "NAME")]
+    session: Option<String>,
+
+    /// herdr agent kind to watch (default: claude).
+    #[arg(long, value_name = "KIND")]
+    kind: Option<String>,
+
+    /// Resume text sent when the window opens (default: continue).
+    #[arg(long, value_name = "TEXT")]
+    resume_msg: Option<String>,
+
+    /// Custom delegation prompt (default: the embedded one).
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
+
+    /// Don't auto-install the statusLine hook on daemon start.
+    #[arg(long)]
+    no_install_hook: bool,
+
+    /// Path of the guard state file (default: ~/.local/state/climax/state.json).
+    #[arg(long, value_name = "PATH")]
+    state_file: Option<PathBuf>,
+
+    /// Path of the statusline cache written by the hook.
+    #[arg(long, value_name = "PATH")]
+    statusline: Option<PathBuf>,
+
+    /// Path of the Claude Code settings.json. "null" restores the default.
+    #[arg(long, value_name = "PATH")]
+    settings: Option<String>,
 }
 
 // ─────────────────────────────────────────────
@@ -339,11 +410,14 @@ async fn main() -> Result<()> {
 
     let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
 
-    if !cli.set.is_empty() {
+    // Flags directos de configuración (escriben en el TOML, hot-reload).
+    let settings = collect_settings(&cli)?;
+    if !settings.is_empty() {
         if cli.status || cli.dry_run || cli.write_statusline {
-            bail!("--set does not combine with --status/--dry-run/--write-statusline");
+            bail!("config flags don't combine with --status/--dry-run/--write-statusline");
         }
-        return config_set(&config_path, &cli.set);
+        apply_config_settings(&config_path, &settings)?;
+        return Ok(());
     }
 
     let mut config = load_config_from(&config_path)?;
@@ -353,8 +427,7 @@ async fn main() -> Result<()> {
         return write_statusline(&config);
     }
 
-    // Piso duro para el intervalo de polling: nunca menos de 5s, sin
-    // importar lo que diga el config.
+    // Polling interval hard floor: never under 5s, whatever the config says.
     clamp_poll(&mut config);
 
     if cli.status {
@@ -973,45 +1046,123 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Claves aceptadas por `--set`, para no crear claves fantasma por typos.
-const SETTABLE_KEYS: &[&str] = &[
-    "threshold_pct",
-    "warning_lead_time_secs",
-    "safety_margin_secs",
-    "poll_interval_secs",
-    "herdr_bin",
-    "herdr_session",
-    "herdr_agent_kind",
-    "herdr_agent_target",
-    "forced_resets_at",
-    "delegation_prompt",
-    "delegation",
-    "resume_message",
-    "install_statusline_hook",
-    "claude_settings_path",
-    "state_path",
-    "statusline_json_path",
-];
-
-/// Convierte el valor string de --set en un valor TOML tipado
-/// (bool → Boolean, entero → Integer, flotante → Float, resto → String).
-fn config_value(s: &str) -> toml::Value {
-    match s {
-        "true" => toml::Value::Boolean(true),
-        "false" => toml::Value::Boolean(false),
-        "null" => toml::Value::String("\u{0}NULL\u{0}".to_string()),
-        _ => s
-            .parse::<i64>()
-            .map(toml::Value::Integer)
-            .or_else(|_| s.parse::<f64>().map(toml::Value::Float))
-            .unwrap_or_else(|_| toml::Value::String(s.to_string())),
+/// Reúne los flags directos de configuración del CLI en una lista de
+/// (clave, valor) tipados. `None` de valor = borrar la clave (null).
+fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
+    let mut s: Vec<(String, Option<toml::Value>)> = Vec::new();
+    if cli.delegate && cli.no_delegate {
+        bail!("--delegate and --no-delegate are mutually exclusive");
     }
+    if cli.delegate {
+        s.push(("delegation".into(), Some(toml::Value::Boolean(true))));
+    }
+    if cli.no_delegate {
+        s.push(("delegation".into(), Some(toml::Value::Boolean(false))));
+    }
+    if let Some(t) = &cli.target {
+        if t == "null" {
+            s.push(("herdr_agent_target".into(), None));
+        } else {
+            s.push((
+                "herdr_agent_target".into(),
+                Some(toml::Value::String(t.clone())),
+            ));
+        }
+    }
+    if let Some(v) = cli.poll {
+        s.push((
+            "poll_interval_secs".into(),
+            Some(toml::Value::Integer(v as i64)),
+        ));
+    }
+    if let Some(v) = cli.margin {
+        s.push((
+            "safety_margin_secs".into(),
+            Some(toml::Value::Integer(v as i64)),
+        ));
+    }
+    if let Some(v) = cli.warning {
+        s.push((
+            "warning_lead_time_secs".into(),
+            Some(toml::Value::Integer(v as i64)),
+        ));
+    }
+    if let Some(v) = cli.threshold {
+        s.push(("threshold_pct".into(), Some(toml::Value::Float(v))));
+    }
+    if let Some(v) = &cli.forced_reset {
+        if v == "null" {
+            s.push(("forced_resets_at".into(), None));
+        } else {
+            let epoch: i64 = v
+                .parse()
+                .with_context(|| format!("invalid epoch for --forced-reset: '{v}'"))?;
+            s.push(("forced_resets_at".into(), Some(toml::Value::Integer(epoch))));
+        }
+    }
+    if let Some(v) = &cli.herdr {
+        s.push(("herdr_bin".into(), Some(toml::Value::String(v.clone()))));
+    }
+    if let Some(v) = &cli.session {
+        if v == "null" {
+            s.push(("herdr_session".into(), None));
+        } else {
+            s.push(("herdr_session".into(), Some(toml::Value::String(v.clone()))));
+        }
+    }
+    if let Some(v) = &cli.kind {
+        s.push((
+            "herdr_agent_kind".into(),
+            Some(toml::Value::String(v.clone())),
+        ));
+    }
+    if let Some(v) = &cli.resume_msg {
+        s.push((
+            "resume_message".into(),
+            Some(toml::Value::String(v.clone())),
+        ));
+    }
+    if let Some(v) = &cli.prompt {
+        s.push((
+            "delegation_prompt".into(),
+            Some(toml::Value::String(v.clone())),
+        ));
+    }
+    if cli.no_install_hook {
+        s.push((
+            "install_statusline_hook".into(),
+            Some(toml::Value::Boolean(false)),
+        ));
+    }
+    if let Some(p) = &cli.state_file {
+        s.push((
+            "state_path".into(),
+            Some(toml::Value::String(p.display().to_string())),
+        ));
+    }
+    if let Some(p) = &cli.statusline {
+        s.push((
+            "statusline_json_path".into(),
+            Some(toml::Value::String(p.display().to_string())),
+        ));
+    }
+    if let Some(v) = &cli.settings {
+        if v == "null" {
+            s.push(("claude_settings_path".into(), None));
+        } else {
+            s.push((
+                "claude_settings_path".into(),
+                Some(toml::Value::String(v.clone())),
+            ));
+        }
+    }
+    Ok(s)
 }
 
-/// Modo `--set key=value`: mergea las claves en el archivo de config
-/// (creating it if missing), with atomic writes. "null" deletes the key
-/// (para los campos opcionales). El daemon recarga el archivo por mtime.
-fn config_set(path: &Path, entries: &[String]) -> Result<()> {
+/// Escribe los settings en el archivo de config (creándolo si no existe),
+/// con escritura atómica. "null" (None) elimina la clave. El daemon
+/// recarga el archivo por mtime (hot-reload).
+fn apply_config_settings(path: &Path, entries: &[(String, Option<toml::Value>)]) -> Result<()> {
     let mut table: toml::Value = if path.exists() {
         let raw =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -1023,22 +1174,14 @@ fn config_set(path: &Path, entries: &[String]) -> Result<()> {
         .as_table_mut()
         .context("config root is not a TOML table")?;
 
-    for entry in entries {
-        let (key, value) = entry
-            .split_once('=')
-            .with_context(|| format!("invalid --set format '{entry}' (expected key=value)"))?;
-        let key = key.trim();
-        if !SETTABLE_KEYS.contains(&key) {
-            bail!(
-                "unknown key: '{key}'. Valid keys: {}",
-                SETTABLE_KEYS.join(", ")
-            );
-        }
-        let value = value.trim();
-        if value == "null" {
-            root.remove(key);
-        } else {
-            root.insert(key.to_string(), config_value(value));
+    for (key, value) in entries {
+        match value {
+            Some(v) => {
+                root.insert(key.clone(), v.clone());
+            }
+            None => {
+                root.remove(key);
+            }
         }
     }
 
@@ -1050,9 +1193,14 @@ fn config_set(path: &Path, entries: &[String]) -> Result<()> {
         .with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
 
-    for entry in entries {
-        let (k, v) = entry.split_once('=').expect("ya validado");
-        println!("  {k} = {}", v.trim());
+    for (k, v) in entries {
+        match v {
+            Some(value) => println!(
+                "  {k} = {}",
+                toml::to_string(value).unwrap_or_default().trim()
+            ),
+            None => println!("  {k} = (removed)"),
+        }
     }
     println!("Config actualizado en {}", path.display());
     Ok(())
@@ -1083,7 +1231,7 @@ fn save_state(path: &Path, state: &GuardState) -> Result<()> {
 /// en ~/.claude/settings.json -> "statusLine": {"type": "command",
 /// "command": "climax --write-statusline"}.
 /// Prints nothing to stdout: Claude Code might use that output as the
-/// contenido del statusline.
+/// statusline content.
 fn write_statusline(config: &Config) -> Result<()> {
     let mut raw = String::new();
     io::stdin()
