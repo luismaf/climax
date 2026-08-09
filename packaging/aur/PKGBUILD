@@ -1,0 +1,27 @@
+# Maintainer: LuisMa <luismaf@gmail.com>
+pkgname=climax
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Monitor de cuota de Claude Code: JSON hook + auto-resume sobre herdr (sin tmux)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/luismaf/climax"
+license=('MIT')
+depends=('glibc')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/luismaf/climax/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+# Nota: requiere el daemon 'herdr' corriendo y el statusLine hook de Claude
+# Code (climax lo auto-instala en ~/.claude/settings.json al arrancar).
+# Tras instalar: systemctl --user enable --now climax.service si querés el
+# servicio ("climax --install-service" lo hace solo).
+
+build() {
+    cd "$srcdir/climax-$pkgver"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$srcdir/climax-$pkgver"
+    install -Dm755 target/release/climax "$pkgdir/usr/bin/climax"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
