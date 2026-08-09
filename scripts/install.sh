@@ -96,11 +96,20 @@ detect() {
 }
 BRANCH="${CLIMAX_FORCE:-$(detect)}"
 
-install_binary() { # generic Linux/macOS: tar.gz into ~/.local/bin
+install_binary() { # generic Linux/macOS (ARM): tar.gz into ~/.local/bin
     if [ "$OS" = "Darwin" ]; then
         case "$MACH" in
             arm64|aarch64) TRIPLE="aarch64-apple-darwin" ;;
-            *)             TRIPLE="x86_64-apple-darwin" ;;
+            *)
+                echo "-> Intel Mac detected: no prebuilt binary is published for x86_64-apple-darwin"
+                echo "   (GitHub retired the Intel macOS runners). Building from source instead..."
+                echo "   Needs a Rust toolchain: https://rustup.rs"
+                command -v cargo >/dev/null 2>&1 || { echo "   cargo not found — install Rust first: https://rustup.rs" >&2; exit 1; }
+                [ "${CLIMAX_DRY_RUN:-0}" = "1" ] && { echo "-> (dry-run) would run: cargo install --git https://github.com/$REPO.git --tag $VERSION"; return 0; }
+                cargo install --git "https://github.com/$REPO.git" --tag "$VERSION"
+                echo "-> done: ~/.cargo/bin/climax ($VERSION)"
+                return 0
+                ;;
         esac
     else
         case "$MACH" in
