@@ -1,6 +1,6 @@
 [package]
 name = "climax"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Monitor de cuota de Claude Code vía JSON hook + auto-resume, orquestado sobre herdr (sin scraping de UI, sin tmux)"
 license = "MIT"

@@ -1,12 +1,14 @@
 pkgbase = climax
-pkgdesc = Claude Code quota guard: JSON statusLine hook + auto-resume over herdr (no tmux)
-pkgver = 0.4.0
-pkgrel = 1
-url = https://github.com/luismaf/climax
-arch = x86_64
-arch = aarch64
-license = MIT
-makedepends = cargo
-depends = glibc
-source = climax-0.4.0.tar.gz::https://github.com/luismaf/climax/archive/refs/tags/v0.4.0.tar.gz
-sha256sums = SKIP
+	pkgdesc = Claude Code quota guard: JSON statusLine hook + auto-resume over herdr (no tmux)
+	pkgver = 0.4.1
+	pkgrel = 1
+	url = https://github.com/luismaf/climax
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	depends = glibc
+	source = climax-0.4.1.tar.gz::https://github.com/luismaf/climax/archive/refs/tags/v0.4.1.tar.gz
+	sha256sums = SKIP
+
+pkgname = climax
