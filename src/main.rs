@@ -166,7 +166,7 @@ impl Default for Config {
 const DEFAULT_DELEGATION_PROMPT: &str = r#"URGENT — YOUR RATE-LIMIT WINDOW IS ABOUT TO EXPIRE. This Claude Code session is about to hit the hard block (the window comes from your plan/usage — not always 5 hours — and it won't recover until it resets). You have ONE job: maximize the autonomous work of the other agents without you. NO implementing, NO chatting, NO asking permission, NO tokens spent describing what you do.
 MANDATORY PLAN (do it NOW, before the block):
 1. Prepare your session: stop any long-running task and guarantee your session is left easy to resume (check the working tree; no half-made changes without a commit).
-2. Write a work plan of at least 200 hours (or the maximum that makes sense for the current project) in a single file:
+2. Write a work plan of at least 200 hours (or the maximum that makes sense for the current project) — enough that every delegated agent stays busy and advancing for the WHOLE block (~5 hours, while you are gone) — in a single file:
    - PWD/<PROJECT>-delegation-plan.md
    - Clear tasks, prioritized by value and independence, each with a verifiable "done" criterion, in the exact order a fresh agent should execute them.
    - Include at the end a "CONTEXT" block: where the code lives, repo conventions, how to run build/tests, and the current state of the work.
@@ -215,10 +215,13 @@ struct RateInfo {
 // ─────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────
-const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = daemon):
+const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
 
-  (no flags)        Daemon: watches your quota 24/7, warns before the block,
-                    and auto-resumes the agent(s) when the window resets.
+  (no flags)        Status: current state at a glance (quota, window,
+                    delegation, hook, agent states). Read-only.
+  --start           Start the daemon (what a bare `climax` used to do):
+                    watches your quota 24/7, warns before the block, and
+                    auto-resumes the agent(s) when the window resets.
                     If several alive kind='claude' agents exist in herdr,
                     ALL of them are resumed (working ones are not touched).
   --status          Show current state (read-only, doesn't touch anything).
@@ -232,7 +235,12 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = daemon):
                     (copies the binary to ~/.local/bin) and start it.
   --uninstall  Uninstall the service (the binary stays, so the
                     statusline hook keeps working).
-  -d, --delegate    Turn the DELEGATION on (writes the config file).
+  -d, --delegate[=MSG]
+                    Turn the DELEGATION on (writes the config file).
+                    Custom MSG via '-d=MSG' or as trailing arguments
+                    (no quotes needed:  climax -d le diste ...  works).
+                    Prints the active message to stdout. Without MSG,
+                    the embedded default is used.
   -n, --no-delegate Turn the DELEGATION off (default).
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
@@ -252,13 +260,19 @@ DELEGATION — the star (OFF by default):
 
    It's optional and coexists with auto-resume (which keeps working):
 
-     climax -d
-     climax --prompt 'your own prompt'   (customize the delegation text)
+     climax -d                          (prints the message that will be injected)
+     climax -d 'Urgent: ... delegate all the work now ...'
+     climax -d Urgent: delegate all the work now
+                                        (DELEGATION on with a custom message;
+                                        trailing args need no quotes)
+     climax --prompt 'your own prompt'  (customize the delegation text)
      climax -n                          (turn it back off)
 
 CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
 
-  -d, --delegate            delegation = true    (the star, explicitly)
+  -d, --delegate[=MSG]      delegation = true    (the star, explicitly; MSG sets
+                            delegation_prompt)   (MSG also as trailing args;
+                                                 prints the active message)
   -n, --no-delegate         delegation = false   (default)
   -t, --target <name>       herdr_agent_target   ("null" → watch ALL
                             kind='claude' agents; useful to disambiguate).
@@ -278,8 +292,11 @@ CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
       --settings <path>     claude_settings_path ("null" = default).
 
 EXAMPLES:
-  climax                                 Daemon (what the service runs)
+  climax                                 Status (the default; read-only)
+  climax --start                         Daemon (what the service runs)
   climax -d                              Turn the star on (delegation)
+  climax -d 'Delegate everything NOW'    ... with a custom message (quoted)
+  climax -d Delegate everything NOW      ... same, no quotes needed
   climax -t null                          Watch ALL claude agents
   climax -t w5:p2                        Watch only that agent
   climax -x                              Rehearsal without touching agents
@@ -321,13 +338,29 @@ struct Cli {
     #[arg(short = 'x', long)]
     dry_run: bool,
 
+    /// Start the daemon (what a bare `climax` used to do): watches your
+    /// quota 24/7, warns before the block and auto-resumes at the reset.
+    /// With no flags climax now shows the status instead.
+    #[arg(long = "start")]
+    start: bool,
+
     /// Turn DELEGATION on (writes to the config file, hot-reloaded).
-    #[arg(short = 'd', long)]
-    delegate: bool,
+    /// The custom delegation message can be given inline with `-d=MSG`
+    /// (or `--delegate=MSG`) or as trailing arguments (no quotes needed).
+    /// Without it, the embedded default is used. The active message is
+    /// printed to stdout.
+    #[arg(short = 'd', long, value_name = "MSG", require_equals = true)]
+    delegate: Option<Option<String>>,
 
     /// Turn DELEGATION off (default; writes to the config file).
     #[arg(short = 'n', long)]
     no_delegate: bool,
+
+    /// Custom delegation message: every remaining argument, joined with
+    /// spaces, becomes the delegation_prompt. Only meaningful together
+    /// with -d/--delegate (the shell needs no quotes).
+    #[arg(value_name = "MSG...")]
+    message: Vec<String>,
 
     /// Watch ONLY that agent/pane of herdr. "null" clears the pin and
     /// goes back to watching ALL kind='claude' agents.
@@ -431,7 +464,7 @@ async fn main() -> Result<()> {
         if cli.install_service && cli.uninstall_service {
             bail!("--install and --uninstall are mutually exclusive");
         }
-        if cli.status || cli.dry_run || cli.write_statusline {
+        if cli.status || cli.start || cli.dry_run || cli.write_statusline {
             bail!("--install/--uninstall don't combine with other modes");
         }
         return if cli.install_service {
@@ -441,13 +474,17 @@ async fn main() -> Result<()> {
         };
     }
 
+    if cli.status && cli.start {
+        bail!("--status and --start are mutually exclusive");
+    }
+
     let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
 
     // Flags directos de configuración (escriben en el TOML, hot-reload).
     let settings = collect_settings(&cli)?;
     if !settings.is_empty() {
-        if cli.status || cli.dry_run || cli.write_statusline {
-            bail!("config flags don't combine with --status/--dry-run/--write-statusline");
+        if cli.status || cli.start || cli.dry_run || cli.write_statusline {
+            bail!("config flags don't combine with --status/--start/--dry-run/--write-statusline");
         }
         apply_config_settings(&config_path, &settings)?;
         return Ok(());
@@ -463,7 +500,8 @@ async fn main() -> Result<()> {
     // Polling interval hard floor: never under 5s, whatever the config says.
     clamp_poll(&mut config);
 
-    if cli.status {
+    let daemon = cli.start || cli.dry_run;
+    if cli.status || !daemon {
         let info = gather_rate_info(&config)?;
         print_status(&info, &config);
         println!(
@@ -516,7 +554,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    info!("climax started (JSON hook + herdr, no UI scraping)");
+    info!("climax daemon started (JSON hook + herdr, no UI scraping)");
     info!(
         "warning_lead = {}s | poll = {}s | margin = {}s | agent_kind = {}",
         config.warning_lead_time_secs,
@@ -1094,11 +1132,30 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 /// (clave, valor) tipados. `None` de valor = borrar la clave (null).
 fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
     let mut s: Vec<(String, Option<toml::Value>)> = Vec::new();
-    if cli.delegate && cli.no_delegate {
+    if cli.delegate.is_some() && cli.no_delegate {
         bail!("--delegate and --no-delegate are mutually exclusive");
     }
-    if cli.delegate {
+    if !cli.message.is_empty() && cli.delegate.is_none() {
+        bail!("a delegation message requires -d/--delegate");
+    }
+    if let Some(inline) = &cli.delegate {
         s.push(("delegation".into(), Some(toml::Value::Boolean(true))));
+        let trailing = if cli.message.is_empty() {
+            None
+        } else {
+            Some(cli.message.join(" "))
+        };
+        let text = match (inline.as_ref(), trailing) {
+            (Some(_), Some(_)) => bail!(
+                "delegation message given twice: use either '-d=MESSAGE' or trailing text, not both"
+            ),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(t) = text {
+            s.push(("delegation_prompt".into(), Some(toml::Value::String(t))));
+        }
     }
     if cli.no_delegate {
         s.push(("delegation".into(), Some(toml::Value::Boolean(false))));
@@ -1275,6 +1332,19 @@ fn apply_config_settings(path: &Path, entries: &[(String, Option<toml::Value>)])
             }
         }
     }
+    let delegation_on = entries
+        .iter()
+        .any(|(k, v)| k == "delegation" && matches!(v, Some(toml::Value::Boolean(true))));
+    if delegation_on {
+        let cfg = load_config_from(path)?;
+        println!();
+        println!(
+            "{}",
+            painted("Delegation message that will be injected:", CYAN)
+        );
+        println!("{}", cfg.delegation_prompt);
+    }
+
     println!("Config actualizado en {}", path.display());
     Ok(())
 }
@@ -1566,7 +1636,7 @@ fn install_service() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!(
             "--install only applies to Linux with systemd. On this \
-             system run the binary directly (e.g.: nohup climax &)"
+             system run the daemon directly (e.g.: nohup climax --start &)"
         );
     }
     let bin_path = executable_install_path();
@@ -1606,7 +1676,7 @@ fn install_service() -> Result<()> {
          [Service]\n\
          # User services start with a minimal PATH; without this they would \n         # not find herdr (or other ~/.local/bin tools).\n\
          Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-         ExecStart={exe_quoted}\n\
+         ExecStart={exe_quoted} --start\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\

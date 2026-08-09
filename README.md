@@ -107,7 +107,8 @@ makepkg -si
 
 ```bash
 climax --install    # systemd user service, boot autorun (explicit, always)
-climax -s           # the whole picture at a glance
+climax              # the whole picture at a glance (status is the default)
+climax --start      # run the daemon in the foreground
 climax -d           # turn DELEGATION on (the star)
 ```
 
@@ -117,9 +118,11 @@ The service is always your call.
 ## Usage
 
 ```
-MODES (mutually exclusive; no flags = daemon):
+MODES (mutually exclusive; no flags = STATUS):
 
-  (no flags)        Daemon: watches your quota 24/7, warns before the
+  (no flags)        Status: current state at a glance (quota, window,
+                    delegation, hook, agent states). Read-only.
+  --start           Daemon: watches your quota 24/7, warns before the
                     block, and auto-resumes the agent(s) at the reset.
   -d, --delegate    Turn the DELEGATION on (writes the config file).
   -n, --no-delegate Turn the DELEGATION off (default).
@@ -132,8 +135,8 @@ MODES (mutually exclusive; no flags = daemon):
 Examples:
 
 ```bash
-climax                    # daemon (what the service runs)
-climax -s                 # quota + delegation + hook + agent states
+climax                    # status (the default; quota + delegation + hook + agents)
+climax --start            # daemon in the foreground (what the service runs)
 climax -d                 # DELEGATION on: hand over the work before the wall
 climax -t w5:p2           # watch only that agent
 climax -t null            # back to watching every claude agent
@@ -147,7 +150,7 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 
 | Flag | Config key | Default |
 | --- | --- | --- |
-| `-d` / `-n` | `delegation` | `false` |
+| `-d[=MSG]` / `-n` | `delegation` (`MSG` sets `delegation_prompt`) | `false` |
 | `-t <name>` | `herdr_agent_target` | all `claude`-kind agents |
 | `--poll <secs>` | `poll_interval_secs` | `10` |
 | `--margin <secs>` | `safety_margin_secs` | `15` |
