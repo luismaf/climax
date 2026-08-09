@@ -28,6 +28,12 @@ struct Config {
     /// (el reset suele cumplirse a tiempo; 15s cubren skew de reloj).
     #[serde(default = "default_margin")]
     safety_margin_secs: u64,
+    /// Fuerza la ventana de reset (epoch, segundos), ignorando la del
+    /// JSON del hook. Útil si hay varios agentes con distintas ventanas,
+    /// el hook quedó desactualizado, o querés alinear la vigilia con un
+    /// reset concreto. 'null' (default) = usar la del hook.
+    #[serde(default)]
+    forced_resets_at: Option<i64>,
     /// Cada cuántos segundos se chequea el JSON. Se clampea a un mínimo
     /// razonable en runtime para no saturar CPU ni el socket de herdr.
     #[serde(default = "default_poll")]
@@ -120,6 +126,7 @@ impl Default for Config {
             threshold_pct: default_threshold(),
             warning_lead_time_secs: default_warning_lead(),
             safety_margin_secs: default_margin(),
+            forced_resets_at: None,
             poll_interval_secs: default_poll(),
             herdr_bin: default_herdr_bin(),
             herdr_session: None,
@@ -184,75 +191,92 @@ struct RateInfo {
 // ─────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────
+const AFTER_HELP: &str = r#"MODOS (son mutuamente excluyentes; sin flags = daemon):
+
+  (sin flags)        Daemon: vigila tu cuota 24/7, avisa antes del bloqueo,
+                     y destraba el agente automáticamente al reset.
+  --status           Muestra el estado actual (solo lectura, no toca nada).
+  --dry-run          Ensayo completo del daemon SIN ejecutar herdr ni
+                     enviar prompts (solo simula; sí guarda el state.json).
+  --write-statusline Comando hook del statusLine de Claude Code: lee lo que
+                     Claude manda por stdin y lo persiste en
+                     statusline_json_path. Lo invoca Claude Code en cada
+                     render; no se ejecuta a mano.
+  --install-service  Instala el servicio systemd de usuario con autorun en
+                     boot (copia el binario a ~/.local/bin) y lo arranca.
+  --uninstall-service  Desinstala el servicio (el binario queda para el hook).
+  --set KEY=VALUE    Edita la configuración y termina (ver CONFIGURACIÓN).
+
+CONFIGURACIÓN (se edita con --set; el daemon la recarga solo, hot-reload):
+
+  --set delegation_enabled=false   Apaga la delegación a otros agentes
+                                   (el auto-resume de tu agente sigue activo).
+  --set herdr_agent_target=w5:p2   Fija el agente/pane de herdr a vigilar.
+                                   Obligatorio si hay 2+ agentes tipo.
+  --set herdr_agent_target=null    Vuelve al auto-detetección (por kind).
+  --set poll_interval_secs=30      Cadencia de revisión (mínimo 5s).
+  --set safety_margin_secs=60      Segundos tras resets_at para destrabar.
+  --set forced_resets_at=1786292400  Fuerza la ventana de reset (epoch s):
+                                   ignora el resets_at del JSON del hook.
+                                   Útil con varios agentes/ventanas, si el
+                                   hook quedó desactualizado, o para simular.
+                                   'null' vuelve a tomar la del hook.
+  --set install_statusline_hook=false  No auto-instalar el hook (si ya lo
+                                   configuraste a mano en settings.json).
+  --set resume_message='seguimos'  Texto del resume (default: continue).
+  Otras claves: threshold_pct, warning_lead_time_secs, herdr_bin,
+  herdr_session, herdr_agent_kind, delegation_prompt, resume_message,
+  state_path, statusline_json_path, claude_settings_path.
+
+EJEMPLOS:
+  climax                                 Daemon (lo que corre el servicio)
+  climax --dry-run                       Ensayo general sin tocar agentes
+  climax --install-service               Instalar + arrancar el servicio
+  climax --set delegation_enabled=false  Apagar la delegación (en vivo)
+  climax --set herdr_agent_target=w5:p2  Fijar el agente a vigilar
+  climax --status                         Estado actual
+  climax -c /tmp/mi-config.toml --status  Otra config
+
+NOTAS:
+  - Config default: ~/.config/climax/config.toml (creado con --set).
+  - Logs servicio: journalctl --user -u climax.service -f
+"#;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "climax",
     version,
     about = "Claude Code quota guard (JSON hook + auto-resume, orquestado sobre herdr)",
-    after_help = "EJEMPLOS:
-  climax --status                          Estado actual: % usado, reset, target herdr
-  climax --dry-run                       Ensayo general sin tocar herdr ni los agentes
-  climax --install-service              Instala el servicio systemd (autorun en boot)
-  climax --set delegation_enabled=false  Apaga la delegación (el daemon la toma sola)
-  climax --set herdr_agent_target=w5:p2  Fija a qué agente mandar resume/inyectar
-  climax --set poll_interval_secs=30 --set safety_margin_secs=60
-  climax --set herdr_agent_target=null   Vuelve al autodetección de agentes
-  climax -c /tmp/mi-config.toml --status  Usa otra config
-"
+    after_help = AFTER_HELP
 )]
 struct Cli {
-    /// Ruta del archivo de configuración TOML.
-    /// Default: ~/.config/climax/config.toml (si no existe, usa defaults).
+    /// Ruta de la configuración TOML (default: ~/.config/climax/config.toml).
     #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Muestra el estado actual y termina: % de cuota usado, si hay hard
-    /// limit, cuándo resetea, estado del hook, y qué agente(s) herdr va a
-    /// usar. No envía nada, no escribe nada.
+    /// Muestra el estado: % usado, reset, ventana, agente (solo lectura).
     #[arg(long)]
     status: bool,
 
-    /// Corre el loop completo PERO en modo simulación: lee el JSON real,
-    /// detecta bloqueos y avisos, pero NO ejecuta herdr ni envía prompts
-    /// (nada llega a tus agentes). Guarda el state.json igual que el modo
-    /// real, para que la ventana simulada no se repita.
-    /// Útil para probar sin correr riesgos.
+    /// Ensayo: daemon completo sin ejecutar herdr ni enviar prompts.
     #[arg(long)]
     dry_run: bool,
 
-    /// Modo hook del statusLine de Claude Code: LEE el payload JSON que
-    /// Claude Code envía por stdin y lo ESCRIBE (persiste en
-    /// statusline_json_path, default ~/.claude/statusline-cache.json).
-    /// Se invoca solo, por Claude Code, en cada render (nada manual).
-    /// Escribe con tmp+rename (atómico) para que el daemon nunca lea un
-    /// archivo cortado. No valida la cuota: solo guarda el snapshot.
-    #[arg(long, value_name = "PATH")]
+    /// Hook del statusLine de Claude Code: recibe JSON por stdin y lo
+    /// guarda en statusline_json_path (el guard lo lee después).
+    #[arg(long)]
     write_statusline: bool,
 
-    /// Instala climax como servicio de usuario de systemd con autorun en
-    /// el boot (login + linger) y lo arranca. Copia el binario actual a
-    /// ~/.local/bin y genera ~/.config/systemd/user/climax.service
-    /// apuntándolo para que no dependa de la ubicación del código.
-    /// Reejecutarlo después de un rebuild actualiza el binario del
-    /// servicio y lo reinicia.
+    /// Instala el servicio systemd de usuario (autorun en boot) y lo arranca.
     #[arg(long)]
     install_service: bool,
 
-    /// Detiene, deshabilita y elimina el unit de systemd y el autorun.
-    /// NO borra el binario de ~/.local/bin (el hook del statusLine lo
-    /// sigue usando para el guard).
+    /// Desinstala el servicio systemd (conserva el binario del hook).
     #[arg(long)]
     uninstall_service: bool,
 
-    /// Edita la configuración y termina. Setea claves conocidas en el
-    /// archivo de config (default: ~/.config/climax/config.toml,
-    /// creándolo si no existe). Tipos se infieren: true/false → bool,
-    /// números → num, resto → string. 'null' borra la clave.
-    /// El daemon recarga el archivo solo (hot-reload, en el próximo ciclo
-    /// de poll), sin reiniciar. Ejemplos:
-    ///   --set delegation_enabled=false
-    ///   --set herdr_agent_target=w5:p2
-    ///   --set poll_interval_secs=30
+    /// Edita el archivo de configuración (KEY=VALUE, repetible, tipos
+    /// automáticos, 'null' borra la clave). Ver CONFIGURACIÓN arriba.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
 }
@@ -315,6 +339,12 @@ async fn main() -> Result<()> {
                 "desactivada"
             }
         );
+        if let Some(forced) = config.forced_resets_at {
+            println!(
+                "resets_forced  : {} (ventana forzada; ignora el resets_at del hook)",
+                forced
+            );
+        }
         println!(
             "statusline_hook: {}",
             match hook_state(&claude_settings_path(&config)) {
@@ -571,13 +601,16 @@ fn gather_rate_info(config: &Config) -> Result<RateInfo> {
                 .and_then(|x| x.as_i64())
         });
 
-    // Claude a veces manda ms en vez de s
-    let resets_at = resets_raw.map(|ts| {
-        if ts > 1_000_000_000_000 {
-            ts / 1000
-        } else {
-            ts
-        }
+    // Claude a veces manda ms en vez de s. Si hay forced_resets_at en la
+    // config, ese gana siempre (ventana forzada por el usuario).
+    let resets_at = config.forced_resets_at.or_else(|| {
+        resets_raw.map(|ts| {
+            if ts > 1_000_000_000_000 {
+                ts / 1000
+            } else {
+                ts
+            }
+        })
     });
     let now = Utc::now().timestamp();
     let hard_limit_hit = used >= 99.9 || resets_at.is_some_and(|r| now >= r);
@@ -871,6 +904,7 @@ const SETTABLE_KEYS: &[&str] = &[
     "herdr_session",
     "herdr_agent_kind",
     "herdr_agent_target",
+    "forced_resets_at",
     "delegation_prompt",
     "delegation_enabled",
     "resume_message",
