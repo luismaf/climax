@@ -63,6 +63,8 @@ if [ -z "$VERSION" ]; then
     )"
 fi
 [ -n "$VERSION" ] || { echo "could not determine the latest version (no network?)" >&2; exit 1; }
+VERSION="v${VERSION#v}"
+echo "-> climax $VERSION"
 
 OS="$(uname -s)"
 MACH="$(uname -m)"
