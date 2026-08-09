@@ -293,7 +293,7 @@ NOTES:
   - Instead of flags you can edit ~/.config/climax/config.toml by hand
     (same values; the daemon hot-reloads the file).
   - Service logs: journalctl --user -u climax.service -f
-  - Install: sh -c "$(curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh)"
+  - Install: curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh | bash
 "#;
 
 #[derive(Parser, Debug)]

@@ -6,14 +6,52 @@
 [herdr](https://github.com/softarc-herdr/herdr) — no tmux, no UI scraping.
 It watches your rate-limit window through the official JSON `statusLine`
 hook, tells you when the block is coming, and when the window opens again
-it wakes your agent(s) so the work doesn't wait for you.
+it wakes your agent(s) so the work doesn't wait for you. And if you want
+it, it makes your agent *hand the work over* to the others before the
+window closes — the star: [DELEGATION](#the-star-delegation).
 
 Some people hit the 5-hour wall and stop. You? You just wait for the
 second act. The best part is always the *climax*.
 
 ---
 
-## Why
+## The star: DELEGATION
+
+Code shouldn't wait for your quota. Other agents waiting in the same
+herdr shouldn't wait for you either.
+
+When DELEGATION is on, right before its turn ends (the rate-limit window
+is running out, and you still have minutes of breathing room), climax
+injects one last instruction into the main agent:
+
+> "Gather the state of your work: what you did, where you left off, what
+> you tried, what's next. Then SEND it to the other agents on this herdr."
+
+The work — context, plan, open threads — doesn't die with the window. It
+is *handed over* to your other agents, so they keep going while the main
+one recovers. When the window reopens, everyone picks it up:
+
+```
+   hard limit approaching
+            │
+   climax injects the "hand over" prompt
+            │
+   main agent ── gathers state ──► sends it ──► other herdr agents
+            │                                        │
+   window closes                                    they keep working
+            │
+   reset (handled by the auto-resume) ──► everyone continues
+```
+
+Turns on with one flag, off by default, fully optional — the auto-resume
+at the reset keeps working either way:
+
+```bash
+climax -d   # DELEGATION on
+climax -n   # back off (default)
+```
+
+## Other reasons to love it
 
 - **No scraping, no brittle hacks.** It reads the same JSON payload Claude
   Code feeds its own statusline. If Claude sees it, climax sees it.
@@ -22,17 +60,13 @@ second act. The best part is always the *climax*.
 - **Wakes everyone when it frees up.** At the reset it sends a resume to
   every alive `claude`-kind agent in your herdr — working ones are never
   interrupted.
-- **The star: DELEGATION.** Right before its turn ends, the main agent
-  gathers the state of its work and **sends it to the other agents** on
-  the same herdr, so they keep going with full context. Off by default;
-  one flag turns it on.
 
 ## Install
 
 **One line, any OS:**
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh | bash
 ```
 
 It detects your system and does the right thing:
