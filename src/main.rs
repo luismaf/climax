@@ -300,10 +300,15 @@ NOTES:
 #[command(
     name = "climax",
     version,
+    disable_version_flag = true,
     about = "Claude Code quota guard (JSON hook + auto-resume, orchestrated over herdr)",
     after_help = AFTER_HELP
 )]
 struct Cli {
+    /// Print version.
+    #[arg(short = 'v', long = "version")]
+    version: bool,
+
     /// Path to the TOML config file (default: ~/.config/climax/config.toml).
     #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -416,6 +421,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if cli.version {
+        println!("climax {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     if cli.install_service || cli.uninstall_service {
         if cli.install_service && cli.uninstall_service {

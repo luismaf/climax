@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-liner install for climax:
-#   sh -c "$(curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh)"
+#   curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh | bash
+#   pin a release:  ... | bash -s -- -v 0.4.1      (or: bash -s 0.4.1)
 #
 # Detects your system and picks the right method:
 #   Ubuntu/Debian : .deb package via apt
@@ -14,8 +15,35 @@
 #
 # Env overrides (handy for testing): CLIMAX_VERSION=v0.4.1 to pin a release,
 # CLIMAX_FORCE=arch|deb|mac|windows|linux to force a branch, CLIMAX_DRY_RUN=1
-# to only print what would happen.
+# to only print what would happen. CLI: '-v VERSION' or bare VERSION pins a
+# release, e.g.  curl -fsSL <url> | bash -s -- -v 0.4.1
 set -euo pipefail
+
+usage() {
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    echo
+    echo "Options:"
+    echo "  -v, --version VERSION   install a specific release instead of latest"
+    echo "  -h, --help              show this help"
+    echo
+    echo "Env: CLIMAX_VERSION, CLIMAX_FORCE (arch|deb|mac|windows|linux), CLIMAX_DRY_RUN=1"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v|--version)
+            [ $# -ge 2 ] || { echo "option $1 needs a value (e.g. -v 0.4.1)" >&2; exit 1; }
+            CLIMAX_VERSION="$2"
+            shift 2
+            ;;
+        -h|--help) usage; exit 0 ;;
+        -*)
+            if [[ "$1" == v* ]] || [[ "$1" == ?*.*.* ]]; then CLIMAX_VERSION="$1"; shift
+            else echo "unknown option: $1 (try --help)" >&2; exit 1; fi
+            ;;
+        *) CLIMAX_VERSION="$1"; shift ;;
+    esac
+done
 
 REPO="luismaf/climax"
 TMP="$(mktemp -d)"
