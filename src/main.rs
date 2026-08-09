@@ -225,7 +225,7 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
                     If several alive kind='claude' agents exist in herdr,
                     ALL of them are resumed (working ones are not touched).
   --status          Show current state (read-only, doesn't touch anything).
-  --dry-run         Full daemon rehearsal WITHOUT running herdr or sending
+  --rehearsal       Full daemon rehearsal WITHOUT running herdr or sending
                     prompts (only simulates; state.json IS still saved).
   --write-statusline  statusLine hook command for Claude Code: reads the
                     JSON payload Claude sends via stdin and persists it in
@@ -245,7 +245,7 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
   -s, --status      Show current state (read-only, doesn't touch anything).
-  -x, --dry-run     Full daemon rehearsal WITHOUT running herdr or sending
+  -r, --rehearsal   Full daemon rehearsal WITHOUT running herdr or sending
                     prompts (only simulates; state.json IS still saved).
 
 DELEGATION — the star (OFF by default):
@@ -299,7 +299,7 @@ EXAMPLES:
   climax -d Delegate everything NOW      ... same, no quotes needed
   climax -t null                          Watch ALL claude agents
   climax -t w5:p2                        Watch only that agent
-  climax -x                              Rehearsal without touching agents
+  climax -r                              Rehearsal without touching agents
   climax -s                              Status (quota + agents)
   climax -c /tmp/my-config.toml -s       Different config
   climax --install               Install + start the service
@@ -335,7 +335,7 @@ struct Cli {
     status: bool,
 
     /// Rehearsal: full daemon cycle WITHOUT running herdr or sending prompts.
-    #[arg(short = 'x', long)]
+    #[arg(short = 'r', long = "rehearsal")]
     dry_run: bool,
 
     /// Start the daemon (what a bare `climax` used to do): watches your
@@ -484,7 +484,9 @@ async fn main() -> Result<()> {
     let settings = collect_settings(&cli)?;
     if !settings.is_empty() {
         if cli.status || cli.start || cli.dry_run || cli.write_statusline {
-            bail!("config flags don't combine with --status/--start/--dry-run/--write-statusline");
+            bail!(
+                "config flags don't combine with --status/--start/--rehearsal/--write-statusline"
+            );
         }
         apply_config_settings(&config_path, &settings)?;
         return Ok(());
@@ -727,7 +729,7 @@ async fn run_once(
         );
 
         if dry_run {
-            info!("[dry-run] would inject the delegation prompt");
+            info!("[rehearsal] would inject the delegation prompt");
         } else {
             let target = ensure_target(config, cached_target)
                 .await
@@ -984,7 +986,7 @@ async fn resume_targets(
 
         let ok = if dry_run {
             info!(
-                "[dry-run] would send resume to '{}': {}",
+                "[rehearsal] would send resume to '{}': {}",
                 t, config.resume_message
             );
             true
@@ -1534,7 +1536,7 @@ fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
         HookState::NoSettings | HookState::Missing => {
             if dry_run {
                 info!(
-                    "[dry-run] would install the statusLine hook in {}",
+                    "[rehearsal] would install the statusLine hook in {}",
                     settings.display()
                 );
                 return Ok(());

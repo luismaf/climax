@@ -47,8 +47,9 @@ Turns on with one flag, off by default, fully optional — the auto-resume
 at the reset keeps working either way:
 
 ```bash
-climax -d   # DELEGATION on
-climax -n   # back off (default)
+climax -d                    # DELEGATION on (prints the message that will be injected)
+climax -d 'delegate now'     # ... with a custom message (quoted, or as trailing args)
+climax -n                    # back off (default)
 ```
 
 ## Other reasons to love it
@@ -86,7 +87,7 @@ systemd service (boot autorun) is always opt-in with `climax --install`.
 the [releases page](https://github.com/luismaf/climax/releases):
 
 ```bash
-sudo apt install ./climax_0.4.1_amd64.deb
+sudo apt install ./climax_0.4.2_amd64.deb
 ```
 
 **From source:**
@@ -124,12 +125,16 @@ MODES (mutually exclusive; no flags = STATUS):
                     delegation, hook, agent states). Read-only.
   --start           Daemon: watches your quota 24/7, warns before the
                     block, and auto-resumes the agent(s) at the reset.
-  -d, --delegate    Turn the DELEGATION on (writes the config file).
+  -d, --delegate[=MSG]
+                    Turn the DELEGATION on (writes the config file).
+                    MSG = custom delegation message, or pass it as
+                    trailing arguments (no quotes needed). The active
+                    message is printed to stdout.
   -n, --no-delegate Turn the DELEGATION off (default).
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
   -s, --status      Show current state (read-only).
-  -x, --dry-run     Rehearsal without touching herdr or sending prompts.
+  -r, --rehearsal   Rehearsal without touching herdr or sending prompts.
 ```
 
 Examples:
@@ -140,7 +145,7 @@ climax --start            # daemon in the foreground (what the service runs)
 climax -d                 # DELEGATION on: hand over the work before the wall
 climax -t w5:p2           # watch only that agent
 climax -t null            # back to watching every claude agent
-climax -x                 # rehearsal, no side effects
+climax -r                 # rehearsal, no side effects
 ```
 
 ## Configuration
