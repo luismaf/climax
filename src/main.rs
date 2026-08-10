@@ -195,6 +195,12 @@ MANDATORY PLAN (do it NOW, before the block):
 6. When everything is delegated and confirmed: wait calmly for the block. Don't keep consuming tokens; don't redo delegated work; don't write long summaries. A short line is enough.
 When the reset comes (the guard handles it automatically), the first action will be to resume from HANDOFF.md, respecting that the delegated work stays with the other agent."#;
 
+/// Appended to the resume message when DELEGATION is on: while it was blocked
+/// the agent handed its work over to the other herdr agents, so on return it
+/// must tell the team lead that it is back.
+const RESUME_DELEGATION_NOTICE: &str =
+    "Notify the team lead on herdr that you are back and ready to resume the work you delegated.";
+
 // ─────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────
@@ -265,7 +271,7 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
                     alias --threshold; applies with or without resets_at).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
   -s, --status      Show current state (read-only, doesn't touch anything).
-  -r, --rehearsal   Full daemon rehearsal WITHOUT running herdr or sending
+      --rehearsal    Full daemon rehearsal WITHOUT running herdr or sending
                     prompts (only simulates; state.json IS still saved).
 
 DELEGATION — the star (OFF by default):
@@ -285,7 +291,6 @@ DELEGATION — the star (OFF by default):
      climax -d Urgent: delegate all the work now
                                         (DELEGATION on with a custom message;
                                         trailing args need no quotes)
-     climax --prompt 'your own prompt'  (customize the delegation text)
      climax -n                          (turn it back off)
 
 CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
@@ -309,8 +314,9 @@ CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
       --herdr <bin>         herdr binary (default: PATH / ~/.local/bin).
       --session <name>      herdr session ("null" clears).
       --kind <kind>         herdr_agent_kind (default: claude).
-      --resume-msg <text>   resume_message (default: continue).
-      --prompt <text>       delegation_prompt (custom delegation text).
+      -r, --resume <text>   resume_message (default: continue). When
+                            --delegate is on, it also tells the agent to
+                            notify the team lead that it is back.
       --no-install-hook     don't auto-install the statusLine hook.
       --state-file <path>   state_path (daemon state, JSON).
       --statusline <path>   statusline_json_path (hook cache).
@@ -324,7 +330,7 @@ EXAMPLES:
   climax -d Delegate everything NOW      ... same, no quotes needed
   climax -t null                          Watch ALL claude agents
   climax -t w5:p2                        Watch only that agent
-  climax -r                              Rehearsal without touching agents
+  climax --rehearsal                    Rehearsal without touching agents
   climax -s                              Status (quota + agents)
   climax -c /tmp/my-config.toml -s       Different config
   climax --install               Install + start the service
@@ -360,7 +366,7 @@ struct Cli {
     status: bool,
 
     /// Rehearsal: full daemon cycle WITHOUT running herdr or sending prompts.
-    #[arg(short = 'r', long = "rehearsal")]
+    #[arg(long = "rehearsal")]
     dry_run: bool,
 
     /// Start the daemon (what a bare `climax` used to do): watches your
@@ -454,12 +460,8 @@ struct Cli {
     kind: Option<String>,
 
     /// Resume text sent when the window opens (default: continue).
-    #[arg(long, value_name = "TEXT")]
+    #[arg(short = 'r', long = "resume", value_name = "TEXT")]
     resume_msg: Option<String>,
-
-    /// Custom delegation prompt (default: the embedded one).
-    #[arg(long, value_name = "TEXT")]
-    prompt: Option<String>,
 
     /// Don't auto-install the statusLine hook on daemon start.
     #[arg(long)]
@@ -980,6 +982,18 @@ fn gather_rate_info(config: &Config) -> Result<RateInfo> {
 // herdr: discovery and sending (the whole agent interaction layer)
 // ─────────────────────────────────────────────
 
+/// The actual resume text sent to an agent: the configured `resume_message`
+/// (default "continue"), plus — when DELEGATION is on — an extra instruction
+/// telling the agent to notify the team lead that it is back (the work was
+/// handed over while it was blocked, so the lead should know it resumed).
+fn effective_resume_message(config: &Config) -> String {
+    if !config.delegation {
+        return config.resume_message.clone();
+    }
+    let base = config.resume_message.trim().trim_end_matches('.');
+    format!("{base}. {RESUME_DELEGATION_NOTICE}")
+}
+
 #[derive(Debug, Clone)]
 struct HerdrAgentEntry {
     target: String, // name if present, else pane_id
@@ -1167,6 +1181,8 @@ async fn resume_targets(
         targets.len()
     );
 
+    let msg = effective_resume_message(config);
+
     for t in &targets {
         if state.woken_targets.get(t) == Some(&reset_at) {
             debug!("'{}' already has resume for this window, skip", t);
@@ -1174,13 +1190,10 @@ async fn resume_targets(
         }
 
         let ok = if dry_run {
-            info!(
-                "[rehearsal] would send resume to '{}': {}",
-                t, config.resume_message
-            );
+            info!("[rehearsal] would send resume to '{}': {}", t, msg);
             true
         } else {
-            wake_agent(config, t, &config.resume_message).await?
+            wake_agent(config, t, &msg).await?
         };
 
         if ok {
@@ -1452,12 +1465,6 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
     if let Some(v) = &cli.resume_msg {
         s.push((
             "resume_message".into(),
-            Some(toml::Value::String(v.clone())),
-        ));
-    }
-    if let Some(v) = &cli.prompt {
-        s.push((
-            "delegation_prompt".into(),
             Some(toml::Value::String(v.clone())),
         ));
     }
@@ -2063,3 +2070,45 @@ fn print_status(info: &RateInfo, config: &Config) {
     );
     println!("resume_sent     : {}", render(&woken));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_message_is_plain_when_delegation_off() {
+        let cfg = Config {
+            delegation: false,
+            resume_message: "continue".into(),
+            ..Config::default()
+        };
+        assert_eq!(effective_resume_message(&cfg), "continue");
+    }
+
+    #[test]
+    fn resume_message_notifies_team_lead_when_delegation_on() {
+        let cfg = Config {
+            delegation: true,
+            resume_message: "continue".into(),
+            ..Config::default()
+        };
+        let m = effective_resume_message(&cfg);
+        assert_eq!(
+            m,
+            format!("continue. {RESUME_DELEGATION_NOTICE}"),
+            "delegated resume must keep 'continue' and tell the team lead it is back"
+        );
+    }
+
+    #[test]
+    fn custom_resume_message_is_preserved_with_the_notice() {
+        let cfg = Config {
+            delegation: true,
+            resume_message: "continue and read HANDOFF.md.".into(),
+            ..Config::default()
+        };
+        let m = effective_resume_message(&cfg);
+        assert!(m.starts_with("continue and read HANDOFF.md. Notify the team lead"), "got: {m}");
+    }
+}
+

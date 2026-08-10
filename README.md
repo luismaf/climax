@@ -54,6 +54,11 @@ climax -d 'delegate now'     # ... with a custom message (quoted, or as trailing
 climax -n                    # back off (default)
 ```
 
+With DELEGATION on, the auto-resume is smarter too: besides continuing
+(`-r/--resume <text>`, default `continue`), it tells the agent to notify the
+team lead on herdr that it is back — so the lead knows the main agent resumed
+and is ready to take back the delegated work.
+
 ## Other reasons to love it
 
 - **No scraping, no brittle hacks.** It reads the same JSON payload Claude
@@ -136,7 +141,7 @@ MODES (mutually exclusive; no flags = STATUS):
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
   -s, --status      Show current state (read-only).
-  -r, --rehearsal   Rehearsal without touching herdr or sending prompts.
+      --rehearsal    Rehearsal without touching herdr or sending prompts.
 ```
 
 Examples:
@@ -147,7 +152,7 @@ climax --start            # daemon in the foreground (what the service runs)
 climax -d                 # DELEGATION on: hand over the work before the wall
 climax -t w5:p2           # watch only that agent
 climax -t null            # back to watching every claude agent
-climax -r                 # rehearsal, no side effects
+climax --rehearsal        # rehearsal, no side effects
 ```
 
 ## Configuration
@@ -168,8 +173,7 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 | `--herdr <bin>` | `herdr_bin` | `herdr` from PATH |
 | `--session <name>` | `herdr_session` | — |
 | `--kind <kind>` | `herdr_agent_kind` | `claude` |
-| `--resume-msg <text>` | `resume_message` | `continue` |
-| `--prompt <text>` | `delegation_prompt` | the embedded one |
+| `-r, --resume <text>` | `resume_message` | `continue` |
 | `--no-install-hook` | `install_statusline_hook` | `true` |
 | `--state-file <path>` | `state_path` | `~/.local/state/climax/state.json` |
 | `--statusline <path>` | `statusline_json_path` | `~/.claude/statusline-cache.json` |
