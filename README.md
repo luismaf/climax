@@ -20,9 +20,10 @@ second act. The best part is always the *climax*.
 Code shouldn't wait for your quota. Other agents waiting in the same
 herdr shouldn't wait for you either.
 
-When DELEGATION is on, right before its turn ends (the rate-limit window
-is running out, and you still have minutes of breathing room), climax
-injects one last instruction into the main agent:
+When DELEGATION is on, right before the window ends (it never sleeps
+through the warning window, and monitors every 5s once usage >= 85%),
+climax injects one last instruction into **every alive `claude`-kind
+agent** (or only the pinned one with `--no-all`):
 
 > "Gather the state of your work: what you did, where you left off, what
 > you tried, what's next. Then SEND it to the other agents on this herdr."
@@ -157,10 +158,11 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 | --- | --- | --- |
 | `-d[=MSG]` / `-n` | `delegation` (`MSG` sets `delegation_prompt`) | `false` |
 | `-t <name>` | `herdr_agent_target` | all `claude`-kind agents |
-| `--poll <secs>` | `poll_interval_secs` | `10` |
+| `-a` / `-o, --no-all` | `resume_all` | `true` (resume+delegation reach ALL `claude`-kind windows) |
+| `--poll <secs>` | `poll_interval_secs` | `10` (5s inside the danger zone, >= threshold) |
 | `--margin <secs>` | `safety_margin_secs` | `15` |
 | `--warning <secs>` | `warning_lead_time_secs` | `300` |
-| `--threshold <pct>` | `threshold_pct` | `85` |
+| `-p, --percent <pct>` | `threshold_pct` | `85` (fires delegation at this %, with or without `resets_at`; alias `--threshold`) |
 | `--forced-reset <epoch>` | `forced_resets_at` | — |
 | `--herdr <bin>` | `herdr_bin` | `herdr` from PATH |
 | `--session <name>` | `herdr_session` | — |

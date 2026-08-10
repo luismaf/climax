@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ─────────────────────────────────────────────
 // Colors (only when stdout is a terminal)
@@ -35,7 +35,8 @@ fn painted(s: &str, code: &str) -> String {
 // ─────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    /// Porcentaje de fallback (si no hay resets_at)
+    /// Porcentaje de uso que dispara la delegación y el monitoreo fino
+    /// cada 5s (default 85). Se alcanza con o sin resets_at en el hook.
     #[serde(default = "default_threshold")]
     threshold_pct: f64,
     /// Segundos antes del bloqueo para inyectar el aviso (default 300s = 5 min)
@@ -73,6 +74,13 @@ struct Config {
     /// If set, NO autodetection is done — it is used as-is.
     /// Needed if you run more than one Claude agent at once.
     herdr_agent_target: Option<String>,
+
+    /// Si true (default), el resume y la delegación alcanzan a TODOS los
+    /// agentes kind='claude' vivos, no solo al pin (herdr_agent_target).
+    /// Con false, la delegación/resume va SOLO al pin (o al primero si no
+    /// hay pin). Configurable con -a/--all y --no-all.
+    #[serde(default = "default_true")]
+    resume_all: bool,
 
     /// Exact delegation prompt text. If not in the config, the embedded
     /// default is used (DEFAULT_DELEGATION_PROMPT).
@@ -152,6 +160,7 @@ impl Default for Config {
             herdr_session: None,
             herdr_agent_kind: default_herdr_agent_kind(),
             herdr_agent_target: None,
+            resume_all: default_true(),
             delegation_prompt: default_delegation_prompt(),
             delegation: false,
             resume_message: default_resume_msg(),
@@ -200,6 +209,11 @@ struct GuardState {
     /// the resume was already sent (multi-target dedup).
     #[serde(default)]
     woken_targets: HashMap<String, i64>,
+    /// Delegation prompt injected per agent: target -> resets_at of the
+    /// window for which the prompt was already delivered (so a failed/incomplete
+    /// injection is retried without spamming the ones that succeeded).
+    #[serde(default)]
+    injected_targets: HashMap<String, i64>,
 }
 
 // ─────────────────────────────────────────────
@@ -243,6 +257,12 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
                     the embedded default is used.
   -n, --no-delegate Turn the DELEGATION off (default).
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
+  -a, --all         Resume AND delegate to ALL kind='claude' windows
+                    (default: on). Only meaningful with several agents.
+  -o, --no-all        Resume/delegate ONLY to the pinned herdr_agent_target
+                    (or the first detected one). Opposite of -a.
+  -p, --percent     % of usage that fires the delegation (default 85;
+                    alias --threshold; applies with or without resets_at).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
   -s, --status      Show current state (read-only, doesn't touch anything).
   -r, --rehearsal   Full daemon rehearsal WITHOUT running herdr or sending
@@ -276,10 +296,15 @@ CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
   -n, --no-delegate         delegation = false   (default)
   -t, --target <name>       herdr_agent_target   ("null" → watch ALL
                             kind='claude' agents; useful to disambiguate).
-      --poll <secs>         poll_interval_secs   (min 5, default 10).
+  -a, --all                 resume_all = true    (default: ALL kind='claude'
+                            windows get resumed AND delegated).
+      -o, --no-all              resume_all = false   (only the pinned target).
+      --poll <secs>         poll_interval_secs   (min 5, default 10; in the
+                            danger zone >=threshold it polls every 5s).
       --margin <secs>       safety_margin_secs   (default 15, post-reset).
       --warning <secs>      warning_lead_time_secs (default 300).
-      --threshold <pct>     threshold_pct (85; only when no resets_at).
+      -p, --percent <pct>     % de uso que dispara la delegación (default 85;
+                    alias --threshold; se cumple haya o no resets_at).
       --forced-reset <epoch>  Force the reset window ("null" clears).
       --herdr <bin>         herdr binary (default: PATH / ~/.local/bin).
       --session <name>      herdr session ("null" clears).
@@ -367,6 +392,16 @@ struct Cli {
     #[arg(short = 't', long, value_name = "AGENT")]
     target: Option<String>,
 
+    /// Resume/delegate to ALL kind='claude' windows (default: on), not
+    /// only the pinned herdr_agent_target.
+    #[arg(short = 'a', long)]
+    all: bool,
+
+    /// Resume/delegate ONLY to the pinned herdr_agent_target (or the
+    /// first detected one). Opposite of --all (which is the default).
+    #[arg(short = 'o', long)]
+    no_all: bool,
+
     /// statusLine hook for Claude Code: receives JSON on stdin and stores
     /// it in statusline_json_path (the guard reads it afterwards).
     #[arg(long)]
@@ -392,10 +427,15 @@ struct Cli {
     #[arg(long, value_name = "SECS")]
     warning: Option<u64>,
 
-    /// Fallback % of usage that triggers the warning when there is no
-    /// resets_at in the hook JSON (default 85).
+    /// % de uso que dispara la delegación (y el monitoreo fino cada 5s).
+    /// Se alcanza con o sin resets_at en el JSON del hook (default 85).
     #[arg(long, value_name = "PCT")]
     threshold: Option<f64>,
+
+    /// Same as --threshold, with a short flag: % of usage that fires
+    /// the delegation prompt (default 85).
+    #[arg(short = 'p', long = "percent", value_name = "PCT")]
+    percent: Option<f64>,
 
     /// Force the reset window (epoch seconds). "null" clears it.
     #[arg(long, value_name = "EPOCH")]
@@ -530,6 +570,20 @@ async fn main() -> Result<()> {
                 HookState::Invalid => painted("invalid JSON", RED),
             }
         );
+        println!(
+            "wake_targets   : {}",
+            if config.resume_all {
+                painted(
+                    &format!(
+                        "ALL kind='{}' claude windows (-a/--all, default)",
+                        config.herdr_agent_kind
+                    ),
+                    GREEN,
+                )
+            } else {
+                painted("only the pinned herdr_agent_target (--no-all)", YELLOW)
+            }
+        );
         match resolve_targets(&config).await {
             Ok(targets) => {
                 println!("herdr_targets  : {}", targets.join(", "));
@@ -578,7 +632,6 @@ async fn main() -> Result<()> {
     }
 
     let mut state = load_state(&config.state_path)?;
-    let mut cached_target: Option<String> = None;
     let mut last_config_mtime = file_mtime(&config_path);
 
     loop {
@@ -591,7 +644,6 @@ async fn main() -> Result<()> {
                     Ok(new_config) => {
                         config = new_config;
                         clamp_poll(&mut config);
-                        cached_target = None;
                         info!(
                             "Config hot-reloaded from {} (poll={}s, delegation={})",
                             config_path.display(),
@@ -604,8 +656,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        match run_once(&config, &mut state, &mut cached_target, dry_run).await {
-            Ok(Action::Continue) => {}
+        match run_once(&config, &mut state, dry_run).await {
+            Ok(Action::Continue) => {
+                sleep(Duration::from_secs(config.poll_interval_secs)).await;
+            }
+            Ok(Action::SleepSeconds(secs)) => {
+                // Siempre un piso de 2s en cualquier bucle.
+                sleep(Duration::from_secs(secs.max(2))).await;
+            }
             Ok(Action::SleepUntil(reset_at)) => {
                 let wait = wait_duration(reset_at, config.safety_margin_secs);
                 info!(
@@ -616,9 +674,7 @@ async fn main() -> Result<()> {
 
                 state.last_hard_limit_reset_at = Some(reset_at);
                 save_state(&config.state_path, &state)?;
-                match resume_targets(&config, &mut state, &mut cached_target, reset_at, dry_run)
-                    .await
-                {
+                match resume_targets(&config, &mut state, reset_at, dry_run).await {
                     Ok(()) => {}
                     Err(e) => {
                         // Los targets que no se anotaron se reintentan en el
@@ -627,21 +683,23 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            Err(e) => warn!("Error in cycle: {:#}", e),
+            Err(e) => {
+                warn!("Error in cycle: {:#}", e);
+                sleep(Duration::from_secs(config.poll_interval_secs)).await;
+            }
         }
-        sleep(Duration::from_secs(config.poll_interval_secs)).await;
     }
 }
 
 enum Action {
     Continue,
     SleepUntil(i64),
+    SleepSeconds(u64),
 }
 
 async fn run_once(
     config: &Config,
     state: &mut GuardState,
-    cached_target: &mut Option<String>,
     dry_run: bool,
 ) -> Result<Action> {
     let info = gather_rate_info(config)?;
@@ -651,13 +709,20 @@ async fn run_once(
         info.used_pct, info.resets_at, info.hard_limit_hit
     );
 
-    // 1. Hard limit: dormir y resumir (todos los targets al reset)
+    // 1. Hard limit: dormir y resumir (todos los targets al reset).
+    //    Importante: NUNCA se duerme atravesando la ventana de aviso. Si el
+    //    hard se detecta temprano (used>=99.9 con la ventana todavía lejos),
+    //    se duerme solo hasta que arranque la ventana de aviso y desde ahí
+    //    se monitorea fino: la inyección de la delegación TIENE que pasar
+    //    antes del cartel de límite (una vez que aparece, Claude no acepta
+    //    ningún mensaje).
     if info.hard_limit_hit {
         if let Some(reset_at) = info.resets_at {
             if state.last_hard_limit_reset_at == Some(reset_at) {
                 // Ventana ya procesada: si quedaron targets sin destrabar
-                // (a send failed), retry on the next cycle.
-                match resolve_targets(config).await {
+                // (a send failed or the agent didn't turn working), retry
+                // on the next cycle.
+                match resolve_wake_targets(config).await {
                     Ok(targets) => {
                         let pending = targets
                             .iter()
@@ -689,14 +754,46 @@ async fn run_once(
                 }
                 return Ok(Action::Continue);
             }
-            return Ok(Action::SleepUntil(reset_at));
+            // Ventana NUEVA en hard limit.
+            let remaining = reset_at - now;
+            if now >= reset_at + (config.safety_margin_secs as i64) {
+                // El reset ya pasó (+margin): hora de despertar (el main
+                // manda los resumes con verificación).
+                return Ok(Action::SleepUntil(reset_at));
+            }
+            if remaining > (config.warning_lead_time_secs as i64) {
+                // Hard detectado TEMPRANO (el JSON pegó 99.9 con la ventana
+                // lejos): dormir SOLO hasta que arranque la ventana de
+                // aviso, para llegar despierto y poder inyectar a tiempo.
+                let secs = (remaining - config.warning_lead_time_secs as i64).max(2) as u64;
+                info!(
+                    "Hard limit detected with the window still {}s away: \
+                     sleeping {}s until the warning window (delegation must \
+                     go in before the limit screen)",
+                    remaining, secs
+                );
+                return Ok(Action::SleepSeconds(secs));
+            }
+            // Dentro de la ventana de aviso: inyectar AHORA (los agentes
+            // todavía aceptan input) y seguir monitoreando fino.
+            if config.delegation {
+                if let Err(e) = inject_delegation_prompt(config, state, reset_at, dry_run).await {
+                    warn!("Delegation prompt injection: {:#}", e);
+                }
+            }
+            return Ok(Action::SleepSeconds(config.poll_interval_secs.max(5)));
         }
     }
 
-    // 2. Aviso "unos minutos antes" (warning_lead_time_secs)
+    // 2. Aviso "unos minutos antes" (warning_lead_time_secs). Con
+    // threshold_pct: dispara en cuanto el % de uso lo alcanza, haya o no
+    // resets_at en el JSON (el % manda siempre; arriba solo era fallback
+    // cuando faltaba resets_at, por eso "no delegaba al X%").
     let should_inject = if let Some(reset_at) = info.resets_at {
         let remaining = reset_at - now;
-        remaining > 0 && remaining <= (config.warning_lead_time_secs as i64) && info.used_pct < 99.9
+        remaining > 0
+            && (remaining <= (config.warning_lead_time_secs as i64)
+                || info.used_pct >= config.threshold_pct)
     } else {
         info.used_pct >= config.threshold_pct
     };
@@ -706,14 +803,13 @@ async fn run_once(
             .resets_at
             .unwrap_or(now + config.warning_lead_time_secs as i64);
 
-        if let Some(last) = state.last_injected_reset_at {
-            if (reset_at - last).abs() <= 120 {
-                debug!("Already injected for this window, skip");
-                return Ok(Action::Continue);
-            }
-        }
-
         if !config.delegation {
+            if let Some(last) = state.last_injected_reset_at {
+                if (reset_at - last).abs() <= 120 {
+                    debug!("Already marked this window, skip");
+                    return Ok(Action::Continue);
+                }
+            }
             info!(
                 "Delegation disabled (delegation=false): skipping the \
                  delegation prompt (auto-resume stays active)"
@@ -723,30 +819,117 @@ async fn run_once(
             return Ok(Action::Continue);
         }
 
+        // Si la ventana ya se inyectó por completo, no se vuelve a entrar.
+        if let Some(last) = state.last_injected_reset_at {
+            if (reset_at - last).abs() <= 120 {
+                debug!("Already injected for this window, skip");
+                return Ok(Action::Continue);
+            }
+        }
+
+        let why = if let Some(r) = info.resets_at {
+            let remaining = r - now;
+            if remaining > 0 && remaining <= (config.warning_lead_time_secs as i64) {
+                format!("{remaining}s left")
+            } else {
+                format!("{:.0}% used", info.used_pct)
+            }
+        } else {
+            format!("{:.0}% used, no resets_at", info.used_pct)
+        };
         info!(
-            "Block imminent! (remaining ~{}s) - injecting urgent delegation prompt",
-            reset_at - now
+            "Delegation trigger: {why} — injecting urgent delegation prompt",
         );
 
-        if dry_run {
-            info!("[rehearsal] would inject the delegation prompt");
-        } else {
-            let target = ensure_target(config, cached_target)
-                .await
-                .context("resolving herdr agent to inject the notice")?;
-            if let Err(e) =
-                send_to_herdr(config, &target, &config.delegation_prompt, None, None).await
-            {
-                *cached_target = None;
-                return Err(e).context("delegation prompt injection via herdr failed");
-            }
-            info!("Delegation prompt sent to '{}'", target);
+        if let Err(e) = inject_delegation_prompt(config, state, reset_at, dry_run).await {
+            warn!("Delegation prompt injection: {:#}", e);
         }
-        state.last_injected_reset_at = Some(reset_at);
-        save_state(&config.state_path, state)?;
+    }
+
+    // Zona de peligro: con used >= threshold (default 85%) se monitorea
+    // cada 5s en vez de cada poll_interval_secs, para no pisarte la
+    // ventana de aviso.
+    if info.used_pct >= config.threshold_pct {
+        return Ok(Action::SleepSeconds(5));
     }
 
     Ok(Action::Continue)
+}
+
+/// Envía el prompt de delegación a los targets que aún no lo recibieron
+/// para esta ventana (dedup por target, multi-agente). Solo marca la
+/// ventana como inyectada en `last_injected_reset_at` cuando TODOS la
+/// recibieron: los que fallaron se reintentan en el próximo poll sin
+/// spamear a los que ya la tienen.
+async fn inject_delegation_prompt(
+    config: &Config,
+    state: &mut GuardState,
+    reset_at: i64,
+    dry_run: bool,
+) -> Result<()> {
+    let targets = resolve_wake_targets(config).await?;
+    let mut all_injected = true;
+
+    for t in &targets {
+        if state
+            .injected_targets
+            .get(t)
+            .is_some_and(|&r| (reset_at - r).abs() <= 120)
+        {
+            debug!("'{}' already injected for window {}", t, reset_at);
+            continue;
+        }
+
+        info!("Injecting urgent delegation prompt into '{}' (window {})", t, reset_at);
+
+        let ok = if dry_run {
+            info!("[rehearsal] would inject the delegation prompt into '{}'", t);
+            true
+        } else {
+            match send_to_herdr(
+                config,
+                t,
+                &config.delegation_prompt,
+                Some(&[]),
+                Some(600_000),
+            )
+            .await
+            {
+                Ok(_) => {
+                    info!("Delegation prompt accepted by '{}'", t);
+                    true
+                }
+                Err(e) => {
+                    // Un timeout no significa que no se haya entregado
+                    // (el agente queda ocupado delegando el trabajo y puede
+                    // tardar más que el timeout en settle a idle/done).
+                    if format!("{e:#}").contains("timeout") {
+                        warn!(
+                            "'{}' didn't settle in time after the delegation prompt; \
+                             assuming it was delivered",
+                            t
+                        );
+                        true
+                    } else {
+                        warn!("Delegation to '{}' failed: {:#} — will retry", t, e);
+                        false
+                    }
+                }
+            }
+        };
+
+        if ok {
+            state.injected_targets.insert(t.clone(), reset_at);
+        } else {
+            all_injected = false;
+        }
+    }
+
+    if all_injected {
+        state.last_injected_reset_at = Some(reset_at);
+    }
+    save_state(&config.state_path, state)?;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────
@@ -885,17 +1068,20 @@ fn parse_agent_list(v: &Value) -> Vec<HerdrAgentEntry> {
         .collect()
 }
 
-/// Resolves the targets of `herdr agent ...` (unique names or pane_ids).
-/// If `herdr_agent_target` is set in the config, only that one is used.
-/// ese). Si no, se listan con `herdr agent list` y se filtra por
-/// `herdr_agent_kind`: TODOS los que matcheen son targets (multi-agente:
-/// the reset wakes all; the delegation notice goes to the first one).
+/// Resolves the targets for STATUS display: if `herdr_agent_target` is set
+/// in the config, only that one is shown; otherwise every alive
+/// kind=`herdr_agent_kind` agent from `herdr agent list` is a target.
 /// Zero matches is an explicit error, not a guess.
 async fn resolve_targets(config: &Config) -> Result<Vec<String>> {
     if let Some(explicit) = &config.herdr_agent_target {
         return Ok(vec![explicit.clone()]);
     }
+    auto_detect_targets(config).await
+}
 
+/// Autodetects every alive agent of `herdr_agent_kind` via `herdr agent list`.
+/// NO pin here: this is the set that gets resumed/delegated.
+async fn auto_detect_targets(config: &Config) -> Result<Vec<String>> {
     let output = herdr_command(config)
         .args(["agent", "list"])
         .output()
@@ -934,29 +1120,48 @@ async fn resolve_targets(config: &Config) -> Result<Vec<String>> {
     }
 }
 
-async fn ensure_target(config: &Config, cached: &mut Option<String>) -> Result<String> {
-    if let Some(t) = cached {
-        return Ok(t.clone());
+/// The set that receives resumes and delegation prompts.
+/// With `resume_all` (default ON) it is EVERY alive kind=claude agent —
+/// the pin must not leave the other panels blocked. With `resume_all=false`
+/// only the pinned `herdr_agent_target` is used (or the first detected).
+/// If listing fails and a pin exists, fall back to the pin so the pinned
+/// agent is never skipped.
+async fn resolve_wake_targets(config: &Config) -> Result<Vec<String>> {
+    if !config.resume_all {
+        if let Some(explicit) = &config.herdr_agent_target {
+            return Ok(vec![explicit.clone()]);
+        }
     }
-    let targets = resolve_targets(config).await?;
-    let t = targets[0].clone();
-    info!("Resolved target agent: {}", t);
-    *cached = Some(t.clone());
-    Ok(t)
+    match auto_detect_targets(config).await {
+        Ok(all) => Ok(all),
+        Err(e) => {
+            if let Some(pin) = &config.herdr_agent_target {
+                warn!(
+                    "herdr agent list failed ({:#}); falling back to the pinned target '{}'",
+                    e, pin
+                );
+                Ok(vec![pin.clone()])
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
-/// Despierta TODOS los targets de herdr cuando se abre la ventana.
+/// Despierta los targets de herdr cuando se abre la ventana.
 /// - Agents already `working` are not touched (marked as ok).
 /// - Los que ya fueron resumidos para este `reset_at` se omiten (dedup).
-/// - If a send fails, it stays unmarked: the next cycle retries.
+/// - The resume is verified with `--wait --until working`: if herdr does
+///   NOT observe the agent turning working (input lost on a stale screen),
+///   the target stays unmarked and the next cycle retries until it really
+///   wakes up.
 async fn resume_targets(
     config: &Config,
     state: &mut GuardState,
-    cached_target: &mut Option<String>,
     reset_at: i64,
     dry_run: bool,
 ) -> Result<()> {
-    let targets = resolve_targets(config).await?;
+    let targets = resolve_wake_targets(config).await?;
     info!(
         "Window {} opened: checking {} target(s)",
         reset_at,
@@ -969,21 +1174,6 @@ async fn resume_targets(
             continue;
         }
 
-        if !dry_run {
-            // We don't stomp an agent that is already working: we check
-            // chequeamos su estado real. Si no se puede consultar, se manda
-            // anyway (safer to release than to leave stuck).
-            match get_agent_status(config, t).await {
-                Ok(s) if s == "working" => {
-                    info!("'{}' is already working ({}) — not touching", t, s);
-                    state.woken_targets.insert(t.clone(), reset_at);
-                    continue;
-                }
-                Ok(s) => debug!("'{}' is '{}' → sending resume", t, s),
-                Err(e) => debug!("Could not verify '{}' ({:#}) → sending anyway", t, e),
-            }
-        }
-
         let ok = if dry_run {
             info!(
                 "[rehearsal] would send resume to '{}': {}",
@@ -991,16 +1181,9 @@ async fn resume_targets(
             );
             true
         } else {
-            info!("Sending resume to '{}': {}", t, config.resume_message);
-            match send_to_herdr(config, t, &config.resume_message, None, None).await {
-                Ok(_) => true,
-                Err(e) => {
-                    error!("Error sending resume to '{}': {:#}", t, e);
-                    *cached_target = None;
-                    false
-                }
-            }
+            wake_agent(config, t, &config.resume_message).await?
         };
+
         if ok {
             state.woken_targets.insert(t.clone(), reset_at);
         }
@@ -1008,6 +1191,45 @@ async fn resume_targets(
 
     save_state(&config.state_path, state)?;
     Ok(())
+}
+
+/// Envía el resume a un agente y VERIFICA que realmente arrancó:
+/// `herdr agent prompt --wait --until working` devuelve
+/// `agent_prompt_stalled` si el input no fue aceptado (pantalla vieja de
+/// bloqueo, agente no interactivo), y nosotros tratamos eso como pendiente.
+async fn wake_agent(config: &Config, target: &str, msg: &str) -> Result<bool> {
+    match get_agent_status(config, target).await {
+        Ok(s) if s == "working" => {
+            info!("'{}' is already working — not touching", target);
+            return Ok(true);
+        }
+        Ok(s) => debug!("'{}' is '{}' → sending resume", target, s),
+        Err(e) => debug!("Could not verify '{}' ({:#}) → sending anyway", target, e),
+    }
+
+    info!("Sending resume to '{}': {}", target, msg);
+    match send_to_herdr(config, target, msg, Some(&["working"]), Some(60_000)).await {
+        Ok(v) => {
+            let status = v
+                .pointer("/result/agent/agent_status")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if status == "working" {
+                info!("'{}' accepted the resume (now working)", target);
+                Ok(true)
+            } else {
+                warn!(
+                    "'{}' did not turn working after the resume (status: '{}') — will retry",
+                    target, status
+                );
+                Ok(false)
+            }
+        }
+        Err(e) => {
+            warn!("Resume of '{}' failed: {:#} — will retry on the next cycle", target, e);
+            Ok(false)
+        }
+    }
 }
 
 /// Sends text + Enter atomically via `herdr agent prompt`.
@@ -1172,6 +1394,15 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
             ));
         }
     }
+    if cli.all && cli.no_all {
+        bail!("--all and --no-all are mutually exclusive");
+    }
+    if cli.all {
+        s.push(("resume_all".into(), Some(toml::Value::Boolean(true))));
+    }
+    if cli.no_all {
+        s.push(("resume_all".into(), Some(toml::Value::Boolean(false))));
+    }
     if let Some(v) = cli.poll {
         s.push((
             "poll_interval_secs".into(),
@@ -1190,7 +1421,7 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
             Some(toml::Value::Integer(v as i64)),
         ));
     }
-    if let Some(v) = cli.threshold {
+    if let Some(v) = cli.threshold.or(cli.percent) {
         s.push(("threshold_pct".into(), Some(toml::Value::Float(v))));
     }
     if let Some(v) = &cli.forced_reset {
@@ -1762,6 +1993,30 @@ fn uninstall_service() -> Result<()> {
 }
 
 fn print_status(info: &RateInfo, config: &Config) {
+    let state = load_state(&config.state_path).unwrap_or_default();
+    let fmt_ts = |ts: i64| {
+        DateTime::from_timestamp(ts, 0)
+            .map(|d| d.with_timezone(&Local).format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| ts.to_string())
+    };
+    let mut injected: Vec<_> = state.injected_targets.iter().collect();
+    injected.sort_by(|a, b| a.0.cmp(b.0));
+    let mut woken: Vec<_> = state.woken_targets.iter().collect();
+    woken.sort_by(|a, b| a.0.cmp(b.0));
+    let render = |v: &Vec<(&String, &i64)>| {
+        if v.is_empty() {
+            painted("(ninguna todavía)", YELLOW)
+        } else {
+            painted(
+                &v.iter()
+                    .map(|(t, w)| format!("{t} @{}", fmt_ts(**w)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                GREEN,
+            )
+        }
+    };
+
     println!(
         "used_pct       : {}",
         painted(
@@ -1803,4 +2058,9 @@ fn print_status(info: &RateInfo, config: &Config) {
     } else {
         println!("resets_at      : (desconocido)");
     }
+    println!(
+        "delegation_sent: {}",
+        render(&injected)
+    );
+    println!("resume_sent     : {}", render(&woken));
 }
