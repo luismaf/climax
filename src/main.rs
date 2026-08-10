@@ -250,6 +250,7 @@ EXAMPLES:
   climax                 Status        climax -d 'delegate now'    Delegation on
   climax --start         Daemon        climax -r 'continue'        Custom resume
   climax -t w5:p2        Watch one     climax --rehearsal          Dry run
+  climax -p              Current usage % (machine-readable)      climax --blocked 1/0 state
 
 NOTES:
   Config flags write ~/.config/climax/config.toml (hot-reloaded; edit by hand too).
@@ -276,6 +277,11 @@ struct Cli {
     /// Show status: % used, reset, window, agents (read-only).
     #[arg(short = 's', long)]
     status: bool,
+
+    /// Machine-readable hard-limit status for scripts/apps: prints
+    /// "1" when blocked, "0" otherwise.
+    #[arg(long = "blocked")]
+    blocked: bool,
 
     /// Rehearsal: full daemon cycle WITHOUT running herdr or sending prompts.
     #[arg(long = "rehearsal")]
@@ -351,9 +357,10 @@ struct Cli {
     threshold: Option<f64>,
 
     /// Same as --threshold, with a short flag: % of usage that fires
-    /// the delegation prompt (default 90).
-    #[arg(short = 'p', long = "percent", value_name = "PCT")]
-    percent: Option<f64>,
+    /// the delegation prompt (default 90). Without a number it prints
+    /// the current usage % instead.
+    #[arg(short = 'p', long = "percent", value_name = "PCT", num_args = 0..=1, default_missing_value = "")]
+    percent: Option<String>,
 
     /// Force the reset window (epoch seconds). "null" clears it.
     #[arg(long, value_name = "EPOCH")]
@@ -433,6 +440,22 @@ async fn main() -> Result<()> {
     }
 
     let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
+
+    // `-p` / `--percent` without a number: report the current usage %.
+    if cli.percent.as_deref() == Some("") {
+        let config = load_config_from(&config_path)?;
+        let info = gather_rate_info(&config)?;
+        println!("{:.1}", info.used_pct);
+        return Ok(());
+    }
+
+    // `--blocked`: machine-readable hard-limit status for other apps.
+    if cli.blocked {
+        let config = load_config_from(&config_path)?;
+        let info = gather_rate_info(&config)?;
+        println!("{}", if info.hard_limit_hit { 1 } else { 0 });
+        return Ok(());
+    }
 
     // Direct config flags (write to the TOML, hot-reloaded).
     let settings = collect_settings(&cli)?;
@@ -672,6 +695,18 @@ async fn run_once(
             if now >= reset_at + (config.safety_margin_secs as i64) {
                 // The reset already passed (+margin): time to wake up (the
                 // main loop sends the resumes with verification).
+                if config.delegation
+                    && state
+                        .last_injected_reset_at
+                        .map_or(true, |l| (l - reset_at).abs() > 120)
+                {
+                    warn!(
+                        "Window {reset_at} reset before the delegation was injected \
+                         (missed the warning window): the agent was already at the hard \
+                         limit so the hand-over can't go in now. Check the daemon was \
+                         running and the poll interval was small enough."
+                    );
+                }
                 return Ok(Action::SleepUntil(reset_at));
             }
             if remaining > (config.warning_lead_time_secs as i64) {
@@ -704,9 +739,7 @@ async fn run_once(
     // only a fallback when resets_at was missing, so it "never fired").
     let should_inject = if let Some(reset_at) = info.resets_at {
         let remaining = reset_at - now;
-        remaining > 0
-            && (remaining <= (config.warning_lead_time_secs as i64)
-                || info.used_pct >= config.threshold_pct)
+        remaining <= (config.warning_lead_time_secs as i64) || info.used_pct >= config.threshold_pct
     } else {
         info.used_pct >= config.threshold_pct
     };
@@ -808,9 +841,22 @@ async fn inject_delegation_prompt(
             )
             .await
             {
-                Ok(_) => {
-                    info!("Delegation prompt accepted by '{}'", t);
-                    true
+                Ok(v) => {
+                    // Don't trust a blind success: if the agent was at the
+                    // limit screen (or otherwise couldn't take the prompt),
+                    // herdr reports it as stalled. Treat that as NOT
+                    // delivered so the next poll retries, instead of
+                    // silently recording the window as delegated.
+                    if delegation_stalled(&v) {
+                        warn!(
+                            "'{}' did not accept the delegation prompt (stalled/limit screen) — will retry",
+                            t
+                        );
+                        false
+                    } else {
+                        info!("Delegation prompt accepted by '{}'", t);
+                        true
+                    }
                 }
                 Err(e) => {
                     // A timeout doesn't mean it wasn't delivered (the
@@ -888,6 +934,40 @@ fn gather_rate_info(config: &Config) -> Result<RateInfo> {
         resets_at,
         hard_limit_hit,
     })
+}
+
+/// True when a `herdr agent prompt` response means the prompt was NOT
+/// accepted (stale limit screen, non-interactive agent), so climax should
+/// retry instead of marking the window as delegated. Handles the shapes
+/// herdr returns across versions (a stall boolean and/or a status string
+/// containing "stall").
+fn delegation_stalled(v: &Value) -> bool {
+    const BOOL_KEYS: &[&str] = &[
+        "/result/agent_prompt_stalled",
+        "/result/stalled",
+        "/agent_prompt_stalled",
+        "/stalled",
+    ];
+    if BOOL_KEYS
+        .iter()
+        .any(|k| v.pointer(k).and_then(|x| x.as_bool()).unwrap_or(false))
+    {
+        return true;
+    }
+    const STATUS_KEYS: &[&str] = &[
+        "/result/agent/agent_status",
+        "/result/agent/status",
+        "/result/status",
+        "/status",
+    ];
+    STATUS_KEYS
+        .iter()
+        .any(|k| {
+            v.pointer(k)
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_ascii_lowercase().contains("stall"))
+                .unwrap_or(false)
+        })
 }
 
 // ─────────────────────────────────────────────
@@ -1345,8 +1425,16 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
             Some(toml::Value::Integer(v as i64)),
         ));
     }
-    if let Some(v) = cli.threshold.or(cli.percent) {
+    if let Some(v) = cli.threshold {
         s.push(("threshold_pct".into(), Some(toml::Value::Float(v))));
+    }
+    if let Some(v) = &cli.percent {
+        if !v.is_empty() {
+            let pct: f64 = v
+                .parse()
+                .context("--percent expects a number (or no value to print the usage %)")?;
+            s.push(("threshold_pct".into(), Some(toml::Value::Float(pct))));
+        }
     }
     if let Some(v) = &cli.forced_reset {
         if v == "null" {
@@ -2022,5 +2110,24 @@ mod tests {
         let m = effective_resume_message(&cfg);
         assert!(m.starts_with("continue and read HANDOFF.md. Notify the team lead"), "got: {m}");
     }
+
+    #[test]
+    fn delegation_stalled_detects_boolean_flag() {
+        let v: Value = json!({ "result": { "agent_prompt_stalled": true } });
+        assert!(delegation_stalled(&v), "explicit stall boolean must be caught");
+    }
+
+    #[test]
+    fn delegation_stalled_detects_status_string() {
+        let v: Value = json!({ "result": { "agent": { "agent_status": "agent_prompt_stalled" } } });
+        assert!(delegation_stalled(&v), "status string containing 'stall' must be caught");
+    }
+
+    #[test]
+    fn delegation_stalled_accepts_normal_response() {
+        let v: Value = json!({ "result": { "agent": { "agent_status": "idle" } }, "ok": true });
+        assert!(!delegation_stalled(&v), "a clean accept must not be treated as stalled");
+    }
 }
+
 

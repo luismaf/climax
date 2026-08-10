@@ -168,7 +168,7 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 | `--poll <secs>` | `poll_interval_secs` | `10` (5s inside the danger zone, >= threshold) |
 | `--margin <secs>` | `safety_margin_secs` | `15` |
 | `--warning <secs>` | `warning_lead_time_secs` | `300` |
-| `-p, --percent <pct>` | `threshold_pct` | `90` (fires delegation at this %, with or without `resets_at`; alias `--threshold`) |
+| `-p, --percent <pct>` | `threshold_pct` | `90` (fires delegation at this %, with or without `resets_at`; alias `--threshold`; bare `-p` prints the current usage %) |
 | `--forced-reset <epoch>` | `forced_resets_at` | — |
 | `--herdr <bin>` | `herdr_bin` | `herdr` from PATH |
 | `--session <name>` | `herdr_session` | — |
@@ -180,6 +180,14 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 | `--settings <path>` | `claude_settings_path` | `~/.claude/settings.json` |
 
 Use `null` to clear any optional value: `climax -t null`.
+
+Query commands for scripts and other apps (no config written):
+
+- `climax -s` — human-readable status.
+- `climax -p` — prints the current usage % as a plain number (e.g. `100.0`);
+  with a number (`climax -p 85`) it sets the threshold instead.
+- `climax --blocked` — prints `1` when the hard limit is hit (blocked) or `0`
+  otherwise; meant to be parsed by another Rust app or shell script.
 
 ## How it works
 
