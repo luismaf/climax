@@ -250,7 +250,8 @@ EXAMPLES:
   climax                 Status        climax -d 'delegate now'    Delegation on
   climax --start         Daemon        climax -r 'continue'        Custom resume
   climax -t w5:p2        Watch one     climax --rehearsal          Dry run
-  climax -p              Current usage % (machine-readable)      climax --blocked 1/0 state
+  climax -p              Usage % (machine)  climax -t/-l            List targets/panels
+  climax --blocked       0 or the blocked target(s) (for scripts/apps)
 
 NOTES:
   Config flags write ~/.config/climax/config.toml (hot-reloaded; edit by hand too).
@@ -312,9 +313,14 @@ struct Cli {
     message: Vec<String>,
 
     /// Watch ONLY that agent/pane of herdr. "null" clears the pin and
-    /// goes back to watching ALL kind='claude' agents.
-    #[arg(short = 't', long, value_name = "AGENT")]
+    /// goes back to watching ALL kind='claude' agents. Without a value,
+    /// prints the targets that would be resumed/delegated.
+    #[arg(short = 't', long, value_name = "AGENT", num_args = 0..=1, default_missing_value = "")]
     target: Option<String>,
+
+    /// List every alive `claude` panel (target name or pane_id), one per line.
+    #[arg(short = 'l', long = "list")]
+    list: bool,
 
     /// Resume/delegate to ALL kind='claude' windows (default: on), not
     /// only the pinned herdr_agent_target.
@@ -449,11 +455,56 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `--blocked`: machine-readable hard-limit status for other apps.
+    // `-t` / `--target` without a value: list the targets that would be
+    // resumed/delegated (the pin, or every alive claude agent), one per line.
+    if cli.target.as_deref() == Some("") {
+        let config = load_config_from(&config_path)?;
+        let targets = resolve_wake_targets(&config).await?;
+        for t in &targets {
+            println!("{t}");
+        }
+        return Ok(());
+    }
+
+    // `-l` / `--list`: list every alive `claude` panel (target/pane_id), one per line.
+    if cli.list {
+        let config = load_config_from(&config_path)?;
+        let agents = list_kind_agents(&config).await?;
+        for a in &agents {
+            println!("{a}");
+        }
+        return Ok(());
+    }
+
+    // `--blocked`: machine-readable. Prints "0" when nothing is blocked, or
+    // the blocked target(s) (one per line) when some agent can't work.
     if cli.blocked {
         let config = load_config_from(&config_path)?;
         let info = gather_rate_info(&config)?;
-        println!("{}", if info.hard_limit_hit { 1 } else { 0 });
+        let targets = match resolve_wake_targets(&config).await {
+            Ok(t) => t,
+            Err(_) => Vec::new(),
+        };
+        let blocked: Vec<String> = if info.hard_limit_hit {
+            // Global quota block: every target is blocked.
+            targets
+        } else {
+            let mut b = Vec::new();
+            for t in &targets {
+                let status = get_agent_status(&config, t).await.unwrap_or_default();
+                if agent_is_blocked(&status) {
+                    b.push(t.clone());
+                }
+            }
+            b
+        };
+        if blocked.is_empty() {
+            println!("0");
+        } else {
+            for t in &blocked {
+                println!("{t}");
+            }
+        }
         return Ok(());
     }
 
@@ -1125,6 +1176,47 @@ async fn auto_detect_targets(config: &Config) -> Result<Vec<String>> {
     }
 }
 
+/// Lists every alive `herdr_agent_kind` agent via `herdr agent list`.
+/// Unlike `auto_detect_targets`, an empty match is a valid result (returns
+/// [] instead of bailing), which is what `--list` wants.
+async fn list_kind_agents(config: &Config) -> Result<Vec<String>> {
+    let output = herdr_command(config)
+        .args(["agent", "list"])
+        .output()
+        .await
+        .context("running 'herdr agent list'")?;
+
+    if !output.status.success() {
+        bail!(
+            "'herdr agent list' failed: {}",
+            herdr_error_message(&output.stderr)
+        );
+    }
+
+    let v: Value =
+        serde_json::from_slice(&output.stdout).context("parsing 'herdr agent list' JSON")?;
+    Ok(parse_agent_list(&v)
+        .iter()
+        .filter(|a| a.kind.as_deref() == Some(config.herdr_agent_kind.as_str()))
+        .map(|a| a.target.clone())
+        .collect())
+}
+
+/// Heuristic for `--blocked`: an agent "can't work right now" when its
+/// status is unknown, stalled, at a limit, blocking or erroring — i.e. not
+/// one of the healthy statuses herdr reports for idle/working agents.
+fn agent_is_blocked(status: &str) -> bool {
+    const HEALTHY: &[&str] = &[
+        "working", "busy", "idle", "free", "waiting", "queued", "pending", "done", "ready",
+    ];
+    let s = status.to_ascii_lowercase();
+    !HEALTHY.contains(&s.as_str())
+        || s.contains("stall")
+        || s.contains("limit")
+        || s.contains("block")
+        || s.contains("error")
+}
+
 /// The set that receives resumes and delegation prompts.
 /// With `resume_all` (default ON) it is EVERY alive kind=claude agent —
 /// the pin must not leave the other panels blocked. With `resume_all=false`
@@ -1389,13 +1481,17 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
         s.push(("delegation".into(), Some(toml::Value::Boolean(false))));
     }
     if let Some(t) = &cli.target {
-        if t == "null" {
-            s.push(("herdr_agent_target".into(), None));
-        } else {
-            s.push((
-                "herdr_agent_target".into(),
-                Some(toml::Value::String(t.clone())),
-            ));
+        // Bare `-t` (empty value) is the "list targets" query handled in
+        // main(); it is not a config setting.
+        if !t.is_empty() {
+            if t == "null" {
+                s.push(("herdr_agent_target".into(), None));
+            } else {
+                s.push((
+                    "herdr_agent_target".into(),
+                    Some(toml::Value::String(t.clone())),
+                ));
+            }
         }
     }
     if cli.all && cli.no_all {
@@ -2127,6 +2223,22 @@ mod tests {
     fn delegation_stalled_accepts_normal_response() {
         let v: Value = json!({ "result": { "agent": { "agent_status": "idle" } }, "ok": true });
         assert!(!delegation_stalled(&v), "a clean accept must not be treated as stalled");
+    }
+
+    #[test]
+    fn agent_is_blocked_flags_bad_statuses() {
+        for s in ["stalled", "blocked", "error", "limit_reached", "weird_unknown"] {
+            assert!(agent_is_blocked(s), "{s} should be treated as blocked");
+        }
+    }
+
+    #[test]
+    fn agent_is_blocked_healthy_statuses_are_free() {
+        for s in [
+            "working", "busy", "idle", "free", "waiting", "queued", "pending", "done", "ready",
+        ] {
+            assert!(!agent_is_blocked(s), "{s} should NOT be blocked");
+        }
     }
 }
 

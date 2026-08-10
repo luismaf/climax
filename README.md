@@ -163,7 +163,8 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 | Flag | Config key | Default |
 | --- | --- | --- |
 | `-d[=MSG]` / `-n` | `delegation` (`MSG` sets `delegation_prompt`) | `false` |
-| `-t <name>` | `herdr_agent_target` | all `claude`-kind agents |
+| `-t <name>` | `herdr_agent_target` | all `claude`-kind agents (bare `-t` lists the targets) |
+| `-l, --list` | — (query) | lists every alive `claude` panel |
 | `-a` / `-o, --no-all` | `resume_all` | `true` (resume+delegation reach ALL `claude`-kind windows) |
 | `--poll <secs>` | `poll_interval_secs` | `10` (5s inside the danger zone, >= threshold) |
 | `--margin <secs>` | `safety_margin_secs` | `15` |
@@ -186,8 +187,15 @@ Query commands for scripts and other apps (no config written):
 - `climax -s` — human-readable status.
 - `climax -p` — prints the current usage % as a plain number (e.g. `100.0`);
   with a number (`climax -p 85`) it sets the threshold instead.
-- `climax --blocked` — prints `1` when the hard limit is hit (blocked) or `0`
-  otherwise; meant to be parsed by another Rust app or shell script.
+- `climax -t` — prints the targets that would be resumed/delegated, one per
+  line (the pin if set, otherwise every alive `claude` agent); with a name it
+  pins that agent instead.
+- `climax -l` / `climax --list` — lists every alive `claude` panel
+  (target name or pane_id), one per line.
+- `climax --blocked` — prints `0` when nothing is blocked, or the blocked
+  target(s) (one per line) when an agent can't work (stalled/limit/error, or
+  all when the quota hard limit is hit). Meant to be parsed by another Rust
+  app or shell script.
 
 ## How it works
 
