@@ -235,114 +235,26 @@ struct RateInfo {
 // ─────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────
-const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
+const AFTER_HELP: &str = r#"MODES (no flags = STATUS, read-only):
+  --start            daemon · --status  state · --rehearsal  dry run (no effects)
+  --write-statusline Claude Code hook (stdin JSON -> cache) · --install/--uninstall service
+  -d[=MSG] / -n      DELEGATION on (custom message) / off · -t <name> pin agent
+  -a / -o            resume+delegate ALL claude agents / only the pin
 
-  (no flags)        Status: current state at a glance (quota, window,
-                    delegation, hook, agent states). Read-only.
-  --start           Start the daemon (what a bare `climax` used to do):
-                    watches your quota 24/7, warns before the block, and
-                    auto-resumes the agent(s) when the window resets.
-                    If several alive kind='claude' agents exist in herdr,
-                    ALL of them are resumed (working ones are not touched).
-  --status          Show current state (read-only, doesn't touch anything).
-  --rehearsal       Full daemon rehearsal WITHOUT running herdr or sending
-                    prompts (only simulates; state.json IS still saved).
-  --write-statusline  statusLine hook command for Claude Code: reads the
-                    JSON payload Claude sends via stdin and persists it in
-                    statusline_json_path. Invoked by Claude Code on every
-                    render; not meant to be run by hand.
-  --install  Install the systemd user service with boot autorun
-                    (copies the binary to ~/.local/bin) and start it.
-  --uninstall  Uninstall the service (the binary stays, so the
-                    statusline hook keeps working).
-  -d, --delegate[=MSG]
-                    Turn the DELEGATION on (writes the config file).
-                    Custom MSG via '-d=MSG' or as trailing arguments
-                    (no quotes needed:  climax -d le diste ...  works).
-                    Prints the active message to stdout. Without MSG,
-                    the embedded default is used.
-  -n, --no-delegate Turn the DELEGATION off (default).
-  -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
-  -a, --all         Resume AND delegate to ALL kind='claude' windows
-                    (default: on). Only meaningful with several agents.
-  -o, --no-all        Resume/delegate ONLY to the pinned herdr_agent_target
-                    (or the first detected one). Opposite of -a.
-  -p, --percent     % of usage that fires the delegation (default 90;
-                    alias --threshold; applies with or without resets_at).
-  -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
-  -s, --status      Show current state (read-only, doesn't touch anything).
-      --rehearsal    Full daemon rehearsal WITHOUT running herdr or sending
-                    prompts (only simulates; state.json IS still saved).
-
-DELEGATION — the star (OFF by default):
-
-   Before Claude's turn ends (the rate-limit window is about to run out,
-   per warning_lead_time_secs, default 300s), climax injects into the
-   main agent a prompt asking it to:
-     - gather the state of its work (what it did, where it left off,
-       what it tried), and
-     - delegate it: SEND that info to other agent(s) on the same herdr,
-       so the work keeps moving without you and without losing context.
-
-   It's optional and coexists with auto-resume (which keeps working):
-
-     climax -d                          (prints the message that will be injected)
-     climax -d 'Urgent: ... delegate all the work now ...'
-     climax -d Urgent: delegate all the work now
-                                        (DELEGATION on with a custom message;
-                                        trailing args need no quotes)
-     climax -n                          (turn it back off)
-
-CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
-
-  -d, --delegate[=MSG]      delegation = true    (the star, explicitly; MSG sets
-                            delegation_prompt)   (MSG also as trailing args;
-                                                 prints the active message)
-  -n, --no-delegate         delegation = false   (default)
-  -t, --target <name>       herdr_agent_target   ("null" → watch ALL
-                            kind='claude' agents; useful to disambiguate).
-  -a, --all                 resume_all = true    (default: ALL kind='claude'
-                            windows get resumed AND delegated).
-      -o, --no-all              resume_all = false   (only the pinned target).
-      --poll <secs>         poll_interval_secs   (min 5, default 10; in the
-                            danger zone >=threshold it polls every 5s).
-      --margin <secs>       safety_margin_secs   (default 15, post-reset).
-      --warning <secs>      warning_lead_time_secs (default 300).
-      -p, --percent <pct>     usage % that fires the delegation (default 90;
-                    alias --threshold; applies with or without resets_at).
-      --forced-reset <epoch>  Force the reset window ("null" clears).
-      --herdr <bin>         herdr binary (default: PATH / ~/.local/bin).
-      --session <name>      herdr session ("null" clears).
-      --kind <kind>         herdr_agent_kind (default: claude).
-      -r, --resume <text>   resume_message (default: continue). When
-                            --delegate is on, it also tells the agent to
-                            notify the team lead that it is back.
-      --no-install-hook     don't auto-install the statusLine hook.
-      --state-file <path>   state_path (daemon state, JSON).
-      --statusline <path>   statusline_json_path (hook cache).
-      --settings <path>     claude_settings_path ("null" = default).
+DELEGATION (off by default): before the window ends, asks the main agent to hand
+its work over to the other herdr agents; at the reset the auto-resume wakes them
+("continue", editable with -r/--resume and, with delegation on, tells the team
+lead that the agent is back).
 
 EXAMPLES:
-  climax                                 Status (the default; read-only)
-  climax --start                         Daemon (what the service runs)
-  climax -d                              Turn the star on (delegation)
-  climax -d 'Delegate everything NOW'    ... with a custom message (quoted)
-  climax -d Delegate everything NOW      ... same, no quotes needed
-  climax -t null                          Watch ALL claude agents
-  climax -t w5:p2                        Watch only that agent
-  climax --rehearsal                    Rehearsal without touching agents
-  climax -s                              Status (quota + agents)
-  climax -c /tmp/my-config.toml -s       Different config
-  climax --install               Install + start the service
+  climax                 Status        climax -d 'delegate now'    Delegation on
+  climax --start         Daemon        climax -r 'continue'        Custom resume
+  climax -t w5:p2        Watch one     climax --rehearsal          Dry run
 
 NOTES:
-  - Running the daemon installs only the Claude Code hook, never the
-    service: that is ALWAYS explicit, with climax --install.
-  - Instead of flags you can edit ~/.config/climax/config.toml by hand
-    (same values; the daemon hot-reloads the file).
-  - Service logs: journalctl --user -u climax.service -f
-  - Install: curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh | bash
-"#;
+  Config flags write ~/.config/climax/config.toml (hot-reloaded; edit by hand too).
+  Service logs: journalctl --user -u climax.service -f
+  Install: curl -fsSL https://raw.githubusercontent.com/luismaf/climax/master/scripts/install.sh | bash"#;
 
 #[derive(Parser, Debug)]
 #[command(
