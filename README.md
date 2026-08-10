@@ -140,7 +140,8 @@ MODES (mutually exclusive; no flags = STATUS):
   -n, --no-delegate Turn the DELEGATION off (default).
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
-  -s, --status      Show current state (read-only).
+  -s, --stop        Stop the running daemon (service) without uninstalling it.
+  -l, --list        List every alive 'claude' panel (target/pane_id), one per line.
       --rehearsal    Rehearsal without touching herdr or sending prompts.
 ```
 
@@ -184,7 +185,8 @@ Use `null` to clear any optional value: `climax -t null`.
 
 Query commands for scripts and other apps (no config written):
 
-- `climax -s` — human-readable status.
+- `climax` (no flags) — human-readable status (the default action), or
+  `climax -s` / `climax --stop` — stops the running daemon service.
 - `climax -p` — prints the current usage % as a plain number (e.g. `100.0`);
   with a number (`climax -p 85`) it sets the threshold instead.
 - `climax -t` — prints the targets that would be resumed/delegated, one per

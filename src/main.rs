@@ -236,8 +236,8 @@ struct RateInfo {
 // CLI
 // ─────────────────────────────────────────────
 const AFTER_HELP: &str = r#"MODES (no flags = STATUS, read-only):
-  --start            daemon · --status  state · --rehearsal  dry run (no effects)
-  --write-statusline Claude Code hook (stdin JSON -> cache) · --install/--uninstall service
+  --start            daemon · --rehearsal  dry run (no effects)
+  --write-statusline Claude Code hook (stdin JSON -> cache) · --install/--uninstall/-s, --stop  service
   -d[=MSG] / -n      DELEGATION on (custom message) / off · -t <name> pin agent
   -a / -o            resume+delegate ALL claude agents / only the pin
 
@@ -275,12 +275,12 @@ struct Cli {
     #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Show status: % used, reset, window, agents (read-only).
-    #[arg(short = 's', long)]
-    status: bool,
+    /// Stop the running daemon (systemd user service) without uninstalling it.
+    #[arg(short = 's', long = "stop")]
+    stop: bool,
 
-    /// Machine-readable hard-limit status for scripts/apps: prints
-    /// "1" when blocked, "0" otherwise.
+    /// Machine-readable status for scripts/apps: prints "0" when nothing
+    /// is blocked, or the blocked target(s) (one per line).
     #[arg(long = "blocked")]
     blocked: bool,
 
@@ -410,7 +410,7 @@ struct Cli {
 // ─────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Don't panic when stdout is a closed pipe (e.g. `climax -s | head`).
+    // Don't panic when stdout is a closed pipe (e.g. `climax --blocked | head`).
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -427,22 +427,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.install_service || cli.uninstall_service {
+    if cli.install_service || cli.uninstall_service || cli.stop {
         if cli.install_service && cli.uninstall_service {
             bail!("--install and --uninstall are mutually exclusive");
         }
-        if cli.status || cli.start || cli.dry_run || cli.write_statusline {
-            bail!("--install/--uninstall don't combine with other modes");
+        if cli.stop && (cli.install_service || cli.uninstall_service) {
+            bail!("--stop doesn't combine with --install/--uninstall");
         }
-        return if cli.install_service {
+        if cli.start || cli.dry_run || cli.write_statusline {
+            bail!("--install/--uninstall/--stop don't combine with --start/--rehearsal/--write-statusline");
+        }
+        return if cli.stop {
+            stop_service()
+        } else if cli.install_service {
             install_service()
         } else {
             uninstall_service()
         };
-    }
-
-    if cli.status && cli.start {
-        bail!("--status and --start are mutually exclusive");
     }
 
     let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
@@ -511,10 +512,8 @@ async fn main() -> Result<()> {
     // Direct config flags (write to the TOML, hot-reloaded).
     let settings = collect_settings(&cli)?;
     if !settings.is_empty() {
-        if cli.status || cli.start || cli.dry_run || cli.write_statusline {
-            bail!(
-                "config flags don't combine with --status/--start/--rehearsal/--write-statusline"
-            );
+        if cli.start || cli.dry_run || cli.write_statusline {
+            bail!("config flags don't combine with --start/--rehearsal/--write-statusline");
         }
         apply_config_settings(&config_path, &settings)?;
         return Ok(());
@@ -531,7 +530,8 @@ async fn main() -> Result<()> {
     clamp_poll(&mut config);
 
     let daemon = cli.start || cli.dry_run;
-    if cli.status || !daemon {
+    if !daemon {
+        // No flags: status is the default action.
         let info = gather_rate_info(&config)?;
         print_status(&info, &config);
         println!(
@@ -1766,7 +1766,7 @@ enum HookState {
     Invalid,
 }
 
-/// Read-only inspection of the hook state (fitness for --status).
+/// Read-only inspection of the hook state (fitness for the status display).
 fn hook_state(settings: &Path) -> HookState {
     if !settings.exists() {
         return HookState::NoSettings;
@@ -2055,6 +2055,28 @@ fn install_service() -> Result<()> {
     println!("Status     : systemctl --user status climax.service");
     println!("Logs       : journalctl --user -u climax.service -f");
     println!("Uninstall : climax --uninstall");
+    Ok(())
+}
+
+/// Stops the running daemon (systemd user service). Idempotent: if the
+/// service was never installed (or already stopped), reports and exits
+/// without error.
+fn stop_service() -> Result<()> {
+    match run_systemctl(&["--user", "stop", SERVICE_UNIT_NAME]) {
+        Ok(()) => {
+            println!("climax.service stopped.");
+            println!("Start it again with: climax --start (or systemctl --user start climax.service)");
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            // systemd says "not loaded" when the unit was never started/installed.
+            if msg.contains("not loaded") || msg.contains("not found") {
+                println!("climax.service is not running (install it first with: climax --install).");
+            } else {
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 
