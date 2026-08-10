@@ -1,8 +1,8 @@
 [package]
 name = "climax"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
-description = "Monitor de cuota de Claude Code vía JSON hook + auto-resume, orquestado sobre herdr (sin scraping de UI, sin tmux)"
+description = "Claude Code quota guard: JSON statusLine hook + auto-resume over herdr"
 license = "MIT"
 repository = "https://github.com/luismaf/climax"
 

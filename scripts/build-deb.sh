@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Arma un .deb sin depender de dpkg-deb: usa ar + tar (presente en cualquier
-# sistema). Uso:
-#   scripts/build-deb.sh <versión> <arch: amd64|arm64> <binario> <salida.deb>
+# Builds a .deb without depending on dpkg-deb: uses ar + tar (available on
+# any system). Usage:
+#   scripts/build-deb.sh <version> <arch: amd64|arm64> <binary> <output.deb>
 set -euo pipefail
 
-VERSION="${1:?falta version}"
-ARCH="${2:?falta arquitectura (amd64|arm64)}"
-BIN="${3:?falta binario}"
-OUT="${4:?falta archivo de salida}"
+VERSION="${1:?missing version}"
+ARCH="${2:?missing architecture (amd64|arm64)}"
+BIN="${3:?missing binary}"
+OUT="${4:?missing output file}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -29,11 +29,11 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: LuisMa <luismaf@gmail.com>
 Depends: libc6 (>= 2.17)
-Description: Monitor de cuota de Claude Code via JSON hook + auto-resume sobre herdr
- Vigila la cuota de la ventana de 5 horas de Claude Code a traves del hook
- JSON del statusLine, avisa antes del hard limit (delegacion opcional) y al
- reset destraba automaticamente el/los agentes mediante herdr. Sin tmux, sin
- scraping de UI. Linux/systemd: 'climax --install-service' arma el servicio.
+Description: Claude Code quota guard: JSON statusLine hook + auto-resume over herdr
+ Watches the Claude Code 5-hour rate-limit window through the official JSON
+ statusLine hook, warns before the hard limit (optional delegation) and at
+ the reset automatically unblocks the agent(s) via herdr. No UI scraping.
+ Linux/systemd: 'climax --install' sets up the service.
 EOF
 
 (

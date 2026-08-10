@@ -3,7 +3,8 @@
 > Every great session deserves a proper climax.
 
 `climax` is a quota guard for **Claude Code** sessions orchestrated over
-[herdr](https://github.com/softarc-herdr/herdr) — no tmux, no UI scraping.
+[herdr](https://github.com/softarc-herdr/herdr) — no UI scraping, no
+pane-manager tricks.
 It watches your rate-limit window through the official JSON `statusLine`
 hook, tells you when the block is coming, and when the window opens again
 it wakes your agent(s) so the work doesn't wait for you. And if you want
@@ -88,7 +89,7 @@ systemd service (boot autorun) is always opt-in with `climax --install`.
 the [releases page](https://github.com/luismaf/climax/releases):
 
 ```bash
-sudo apt install ./climax_0.4.2_amd64.deb
+sudo apt install ./climax_0.4.3_amd64.deb
 ```
 
 **From source:**

@@ -1,8 +1,8 @@
 # Maintainer: LuisMa <luismaf@gmail.com>
 pkgname=climax
-pkgver=0.4.2
+pkgver=0.4.3
 pkgrel=1
-pkgdesc="Claude Code quota guard: JSON statusLine hook + auto-resume over herdr (no tmux)"
+pkgdesc="Claude Code quota guard: JSON statusLine hook + auto-resume over herdr"
 arch=('x86_64' 'aarch64')
 url="https://github.com/luismaf/climax"
 license=('MIT')
@@ -12,7 +12,7 @@ source=("$pkgname-$pkgver.tar.gz::https://github.com/luismaf/climax/archive/refs
 sha256sums=('SKIP')
 # Requires the 'herdr' daemon running and the Claude Code statusLine hook
 # (climax auto-installs it into ~/.claude/settings.json on startup).
-# For the systemd user service: 'climax --install-service' (boot autorun,
+# For the systemd user service: 'climax --install' (boot autorun,
 # login-less with loginctl enable-linger).
 
 build() {

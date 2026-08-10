@@ -35,11 +35,11 @@ fn painted(s: &str, code: &str) -> String {
 // ─────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    /// Porcentaje de uso que dispara la delegación y el monitoreo fino
-    /// cada 5s (default 90). Se alcanza con o sin resets_at en el hook.
+    /// Usage % that fires the delegation and the fine-grained 5s
+    /// monitoring (default 90). Applies with or without resets_at.
     #[serde(default = "default_threshold")]
     threshold_pct: f64,
-    /// Segundos antes del bloqueo para inyectar el aviso (default 300s = 5 min)
+    /// Seconds before the block to inject the warning (default 300s = 5 min)
     #[serde(default = "default_warning_lead")]
     warning_lead_time_secs: u64,
     /// Extra seconds after resets_at before sending the resume.
@@ -75,10 +75,10 @@ struct Config {
     /// Needed if you run more than one Claude agent at once.
     herdr_agent_target: Option<String>,
 
-    /// Si true (default), el resume y la delegación alcanzan a TODOS los
-    /// agentes kind='claude' vivos, no solo al pin (herdr_agent_target).
-    /// Con false, la delegación/resume va SOLO al pin (o al primero si no
-    /// hay pin). Configurable con -a/--all y --no-all.
+    /// If true (default), resume and delegation reach ALL alive
+    /// kind='claude' agents, not only the pin (herdr_agent_target).
+    /// If false, delegation/resume goes ONLY to the pin (or the first
+    /// one if no pin). Configurable with -a/--all and -o/--no-all.
     #[serde(default = "default_true")]
     resume_all: bool,
 
@@ -100,12 +100,12 @@ struct Config {
     #[serde(default = "default_statusline_path")]
     statusline_json_path: PathBuf,
 
-    /// Si true (default), al arrancar el daemon verifica que el settings.json
-    /// de Claude Code tenga el statusLine hook de climax y lo instala si
-    /// falta. Nunca pisa un statusLine configurado con otro comando.
+    /// If true (default), on daemon start it verifies that the Claude Code
+    /// settings.json has climax's statusLine hook and installs it if
+    /// missing. Never overwrites a statusLine pointing to another command.
     #[serde(default = "default_true")]
     install_statusline_hook: bool,
-    /// Ruta del settings.json de usuario de Claude Code. Default:
+    /// Path of the user Claude Code settings.json. Default:
     /// $CLAUDE_CONFIG_DIR/settings.json o ~/.claude/settings.json.
     claude_settings_path: Option<PathBuf>,
 }
@@ -217,7 +217,7 @@ struct GuardState {
 }
 
 // ─────────────────────────────────────────────
-// Rate Info (viene del JSON del hook, no de la pantalla)
+// Rate Info (from the hook JSON, not from the screen)
 // ─────────────────────────────────────────────
 #[derive(Debug, Clone, Default)]
 struct RateInfo {
@@ -303,8 +303,8 @@ CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
                             danger zone >=threshold it polls every 5s).
       --margin <secs>       safety_margin_secs   (default 15, post-reset).
       --warning <secs>      warning_lead_time_secs (default 300).
-      -p, --percent <pct>     % de uso que dispara la delegación (default 90;
-                    alias --threshold; se cumple haya o no resets_at).
+      -p, --percent <pct>     usage % that fires the delegation (default 90;
+                    alias --threshold; applies with or without resets_at).
       --forced-reset <epoch>  Force the reset window ("null" clears).
       --herdr <bin>         herdr binary (default: PATH / ~/.local/bin).
       --session <name>      herdr session ("null" clears).
@@ -427,8 +427,8 @@ struct Cli {
     #[arg(long, value_name = "SECS")]
     warning: Option<u64>,
 
-    /// % de uso que dispara la delegación (y el monitoreo fino cada 5s).
-    /// Se alcanza con o sin resets_at en el JSON del hook (default 90).
+    /// Usage % that fires the delegation (and the fine-grained 5s monitoring).
+    /// Applies with or without resets_at in the hook JSON (default 90).
     #[arg(long, value_name = "PCT")]
     threshold: Option<f64>,
 
@@ -520,7 +520,7 @@ async fn main() -> Result<()> {
 
     let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
 
-    // Flags directos de configuración (escriben en el TOML, hot-reload).
+    // Direct config flags (write to the TOML, hot-reloaded).
     let settings = collect_settings(&cli)?;
     if !settings.is_empty() {
         if cli.status || cli.start || cli.dry_run || cli.write_statusline {
@@ -661,7 +661,7 @@ async fn main() -> Result<()> {
                 sleep(Duration::from_secs(config.poll_interval_secs)).await;
             }
             Ok(Action::SleepSeconds(secs)) => {
-                // Siempre un piso de 2s en cualquier bucle.
+                // Always a 2s floor on any loop.
                 sleep(Duration::from_secs(secs.max(2))).await;
             }
             Ok(Action::SleepUntil(reset_at)) => {
@@ -677,7 +677,7 @@ async fn main() -> Result<()> {
                 match resume_targets(&config, &mut state, reset_at, dry_run).await {
                     Ok(()) => {}
                     Err(e) => {
-                        // Los targets que no se anotaron se reintentan en el
+                        // Targets that didn't get marked are retried on the
                         // next cycle (run_once detects pending targets).
                         warn!("Multi-target resume incomplete: {:#}", e);
                     }
@@ -709,17 +709,16 @@ async fn run_once(
         info.used_pct, info.resets_at, info.hard_limit_hit
     );
 
-    // 1. Hard limit: dormir y resumir (todos los targets al reset).
-    //    Importante: NUNCA se duerme atravesando la ventana de aviso. Si el
-    //    hard se detecta temprano (used>=99.9 con la ventana todavía lejos),
-    //    se duerme solo hasta que arranque la ventana de aviso y desde ahí
-    //    se monitorea fino: la inyección de la delegación TIENE que pasar
-    //    antes del cartel de límite (una vez que aparece, Claude no acepta
-    //    ningún mensaje).
+    // 1. Hard limit: sleep and resume (all targets at the reset).
+    //    Important: NEVER sleep through the warning window. If the hard
+    //    limit is detected early (used>=99.9 with the window still far),
+    //    sleep only until the warning window starts and from there monitor
+    //    closely: the delegation injection MUST happen before the limit
+    //    screen (once it shows, Claude accepts no input).
     if info.hard_limit_hit {
         if let Some(reset_at) = info.resets_at {
             if state.last_hard_limit_reset_at == Some(reset_at) {
-                // Ventana ya procesada: si quedaron targets sin destrabar
+                // Window already processed: if any target is still stuck
                 // (a send failed or the agent didn't turn working), retry
                 // on the next cycle.
                 match resolve_wake_targets(config).await {
@@ -754,17 +753,17 @@ async fn run_once(
                 }
                 return Ok(Action::Continue);
             }
-            // Ventana NUEVA en hard limit.
+            // NEW window in hard limit.
             let remaining = reset_at - now;
             if now >= reset_at + (config.safety_margin_secs as i64) {
-                // El reset ya pasó (+margin): hora de despertar (el main
-                // manda los resumes con verificación).
+                // The reset already passed (+margin): time to wake up (the
+                // main loop sends the resumes with verification).
                 return Ok(Action::SleepUntil(reset_at));
             }
             if remaining > (config.warning_lead_time_secs as i64) {
-                // Hard detectado TEMPRANO (el JSON pegó 99.9 con la ventana
-                // lejos): dormir SOLO hasta que arranque la ventana de
-                // aviso, para llegar despierto y poder inyectar a tiempo.
+                // Hard limit detected EARLY (the JSON showed 99.9 with the
+                // window far away): sleep ONLY until the warning window
+                // starts, to arrive awake and inject on time.
                 let secs = (remaining - config.warning_lead_time_secs as i64).max(2) as u64;
                 info!(
                     "Hard limit detected with the window still {}s away: \
@@ -774,8 +773,8 @@ async fn run_once(
                 );
                 return Ok(Action::SleepSeconds(secs));
             }
-            // Dentro de la ventana de aviso: inyectar AHORA (los agentes
-            // todavía aceptan input) y seguir monitoreando fino.
+            // Inside the warning window: inject NOW (the agents still
+            // accept input) and keep monitoring closely.
             if config.delegation {
                 if let Err(e) = inject_delegation_prompt(config, state, reset_at, dry_run).await {
                     warn!("Delegation prompt injection: {:#}", e);
@@ -785,10 +784,10 @@ async fn run_once(
         }
     }
 
-    // 2. Aviso "unos minutos antes" (warning_lead_time_secs). Con
-    // threshold_pct: dispara en cuanto el % de uso lo alcanza, haya o no
-    // resets_at en el JSON (el % manda siempre; arriba solo era fallback
-    // cuando faltaba resets_at, por eso "no delegaba al X%").
+    // 2. Warning "a few minutes before" (warning_lead_time_secs). With
+    // threshold_pct: fires as soon as the usage % reaches it, with or
+    // without resets_at in the JSON (the % always wins; before, it was
+    // only a fallback when resets_at was missing, so it "never fired").
     let should_inject = if let Some(reset_at) = info.resets_at {
         let remaining = reset_at - now;
         remaining > 0
@@ -819,7 +818,7 @@ async fn run_once(
             return Ok(Action::Continue);
         }
 
-        // Si la ventana ya se inyectó por completo, no se vuelve a entrar.
+        // If the whole window was already injected, don't re-enter it.
         if let Some(last) = state.last_injected_reset_at {
             if (reset_at - last).abs() <= 120 {
                 debug!("Already injected for this window, skip");
@@ -846,9 +845,9 @@ async fn run_once(
         }
     }
 
-    // Zona de peligro: con used >= threshold (default 90%) se monitorea
-    // cada 5s en vez de cada poll_interval_secs, para no pisarte la
-    // ventana de aviso.
+    // Danger zone: with used >= threshold (default 90%) it monitors every
+    // 5s instead of every poll_interval_secs, so the warning window is
+    // never missed.
     if info.used_pct >= config.threshold_pct {
         return Ok(Action::SleepSeconds(5));
     }
@@ -856,11 +855,11 @@ async fn run_once(
     Ok(Action::Continue)
 }
 
-/// Envía el prompt de delegación a los targets que aún no lo recibieron
-/// para esta ventana (dedup por target, multi-agente). Solo marca la
-/// ventana como inyectada en `last_injected_reset_at` cuando TODOS la
-/// recibieron: los que fallaron se reintentan en el próximo poll sin
-/// spamear a los que ya la tienen.
+/// Sends the delegation prompt to the targets that haven't received it
+/// yet for this window (dedup per target, multi-agent). Only marks the
+/// window as injected in `last_injected_reset_at` when ALL of them got
+/// it: the ones that failed are retried on the next poll without
+/// spamming the ones that already have it.
 async fn inject_delegation_prompt(
     config: &Config,
     state: &mut GuardState,
@@ -900,9 +899,9 @@ async fn inject_delegation_prompt(
                     true
                 }
                 Err(e) => {
-                    // Un timeout no significa que no se haya entregado
-                    // (el agente queda ocupado delegando el trabajo y puede
-                    // tardar más que el timeout en settle a idle/done).
+                    // A timeout doesn't mean it wasn't delivered (the
+                    // agent stays busy delegating the work and can take
+                    // longer than the timeout to settle to idle/done).
                     if format!("{e:#}").contains("timeout") {
                         warn!(
                             "'{}' didn't settle in time after the delegation prompt; \
@@ -933,7 +932,7 @@ async fn inject_delegation_prompt(
 }
 
 // ─────────────────────────────────────────────
-// Lectura del JSON (Statusline Hook) — 100% independiente del pane manager
+// JSON reading (Statusline Hook) — 100% independent of the pane manager
 // ─────────────────────────────────────────────
 fn gather_rate_info(config: &Config) -> Result<RateInfo> {
     let path = resolve_path(&config.statusline_json_path);
@@ -956,8 +955,8 @@ fn gather_rate_info(config: &Config) -> Result<RateInfo> {
                 .and_then(|x| x.as_i64())
         });
 
-    // Claude a veces manda ms en vez de s. Si hay forced_resets_at en la
-    // config, ese gana siempre (ventana forzada por el usuario).
+    // Claude sometimes sends ms instead of s. If forced_resets_at is set
+    // in the config, it always wins (user-forced window).
     let resets_at = config.forced_resets_at.or_else(|| {
         resets_raw.map(|ts| {
             if ts > 1_000_000_000_000 {
@@ -978,7 +977,7 @@ fn gather_rate_info(config: &Config) -> Result<RateInfo> {
 }
 
 // ─────────────────────────────────────────────
-// herdr: discovery and sending (replaces the whole tmux block)
+// herdr: discovery and sending (the whole agent interaction layer)
 // ─────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -987,9 +986,9 @@ struct HerdrAgentEntry {
     kind: Option<String>,
 }
 
-/// Resuelve el binario de herdr a invocar: si `herdr_bin` es una ruta
-/// (absoluta o con /), se usa tal cual. Si es solo un nombre, se busca
-/// primero en ~/.local/bin (los servicios systemd de usuario corren con
+/// Resolves the herdr binary to invoke: if `herdr_bin` is a path
+/// (absolute or with /), it is used as-is. If it is just a name, it is
+/// looked up first in ~/.local/bin (user systemd services run with
 /// a minimal PATH and can't see $HOME bins) and then falls back to the process
 /// PATH. Returns path-or-name, always usable by Command::new.
 fn herdr_bin_resolved(config: &Config) -> PathBuf {
@@ -1018,7 +1017,7 @@ fn herdr_error_message(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return "(sin salida de error)".to_string();
+        return "(no error output)".to_string();
     }
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         let err = v.get("error").cloned().unwrap_or(v);
@@ -1115,7 +1114,7 @@ async fn auto_detect_targets(config: &Config) -> Result<Vec<String>> {
                 .map(|a| format!("{}({})", a.target, a.kind.as_deref().unwrap_or("?")))
                 .collect::<Vec<_>>()
         ),
-        // Ojo: devolvemos TODOS los que matchean (multi-target), no solo uno.
+        // Note: we return ALL the matches (multi-target), not just one.
         all => Ok(all.to_vec()),
     }
 }
@@ -1148,9 +1147,9 @@ async fn resolve_wake_targets(config: &Config) -> Result<Vec<String>> {
     }
 }
 
-/// Despierta los targets de herdr cuando se abre la ventana.
+/// Wakes the herdr targets when the window opens.
 /// - Agents already `working` are not touched (marked as ok).
-/// - Los que ya fueron resumidos para este `reset_at` se omiten (dedup).
+/// - The ones already resumed for this `reset_at` are skipped (dedup).
 /// - The resume is verified with `--wait --until working`: if herdr does
 ///   NOT observe the agent turning working (input lost on a stale screen),
 ///   the target stays unmarked and the next cycle retries until it really
@@ -1193,10 +1192,10 @@ async fn resume_targets(
     Ok(())
 }
 
-/// Envía el resume a un agente y VERIFICA que realmente arrancó:
-/// `herdr agent prompt --wait --until working` devuelve
-/// `agent_prompt_stalled` si el input no fue aceptado (pantalla vieja de
-/// bloqueo, agente no interactivo), y nosotros tratamos eso como pendiente.
+/// Sends the resume to an agent and VERIFIES it actually started:
+/// `herdr agent prompt --wait --until working` returns
+/// `agent_prompt_stalled` if the input wasn't accepted (stale limit
+/// screen, non-interactive agent), and we treat that as pending.
 async fn wake_agent(config: &Config, target: &str, msg: &str) -> Result<bool> {
     match get_agent_status(config, target).await {
         Ok(s) if s == "working" => {
@@ -1233,7 +1232,7 @@ async fn wake_agent(config: &Config, target: &str, msg: &str) -> Result<bool> {
 }
 
 /// Sends text + Enter atomically via `herdr agent prompt`.
-/// Sin shell, sin buffers, sin C-c previo: `agent prompt` funciona
+/// No shell, no buffers, no C-c beforehand: `agent prompt` works
 /// even while the agent is working.
 async fn send_to_herdr(
     config: &Config,
@@ -1257,7 +1256,7 @@ async fn send_to_herdr(
     let output = cmd
         .output()
         .await
-        .with_context(|| format!("ejecutando 'herdr agent prompt {target}'"))?;
+        .with_context(|| format!("running 'herdr agent prompt {target}'"))?;
 
     if !output.status.success() {
         bail!(
@@ -1275,7 +1274,7 @@ async fn get_agent_status(config: &Config, target: &str) -> Result<String> {
         .args(["agent", "get", target])
         .output()
         .await
-        .context("ejecutando 'herdr agent get'")?;
+        .context("running 'herdr agent get'")?;
 
     if !output.status.success() {
         bail!("{}", herdr_error_message(&output.stderr));
@@ -1297,7 +1296,7 @@ async fn get_agent_status(config: &Config, target: &str) -> Result<String> {
         None => {
             let raw = serde_json::to_string(&v).unwrap_or_default();
             bail!(
-                "no se pudo extraer el estado del agente; respuesta cruda: {}",
+                "could not extract the agent status; raw response: {}",
                 raw.chars().take(300).collect::<String>()
             )
         }
@@ -1305,7 +1304,7 @@ async fn get_agent_status(config: &Config, target: &str) -> Result<String> {
 }
 
 // ─────────────────────────────────────────────
-// Helpers (config/estado, sin cambios de fondo)
+// Helpers (config/state, no background changes)
 // ─────────────────────────────────────────────
 fn resolve_path(p: &Path) -> PathBuf {
     if let Some(s) = p.to_str() {
@@ -1329,18 +1328,18 @@ fn load_config_from(path: &Path) -> Result<Config> {
         let content = fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
     } else {
-        warn!("No hay config en {:?}, usando defaults", path);
+        warn!("No config at {:?}, using defaults", path);
         Ok(Config::default())
     }
 }
 
-/// Piso duro para el intervalo de polling: nunca menos de 5s, sin
-/// importar lo que diga el config. Evita martillar CPU/socket.
+/// Hard floor for the polling interval: never under 5s, no matter what
+/// the config says. Avoids hammering the CPU/socket.
 fn clamp_poll(config: &mut Config) {
     const MIN_POLL_SECS: u64 = 5;
     if config.poll_interval_secs < MIN_POLL_SECS {
         warn!(
-            "poll_interval_secs={} es demasiado bajo, se ajusta a {}s",
+            "poll_interval_secs={} is too low, clamping to {}s",
             config.poll_interval_secs, MIN_POLL_SECS
         );
         config.poll_interval_secs = MIN_POLL_SECS;
@@ -1352,8 +1351,8 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Reúne los flags directos de configuración del CLI en una lista de
-/// (clave, valor) tipados. `None` de valor = borrar la clave (null).
+/// Collects the CLI direct config flags into a list of typed
+/// (key, value) pairs. A `None` value = remove the key (null).
 fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
     let mut s: Vec<(String, Option<toml::Value>)> = Vec::new();
     if cli.delegate.is_some() && cli.no_delegate {
@@ -1503,9 +1502,9 @@ fn toml_inline(v: &toml::Value) -> String {
     }
 }
 
-/// Escribe los settings en el archivo de config (creándolo si no existe),
-/// con escritura atómica. "null" (None) elimina la clave. El daemon
-/// recarga el archivo por mtime (hot-reload).
+/// Writes the settings into the config file (creating it if it doesn't
+/// exist) with an atomic write. "null" (None) removes the key. The
+/// daemon reloads the file by mtime (hot-reload).
 fn apply_config_settings(path: &Path, entries: &[(String, Option<toml::Value>)]) -> Result<()> {
     let mut table: toml::Value = if path.exists() {
         let raw =
@@ -1578,7 +1577,7 @@ fn apply_config_settings(path: &Path, entries: &[(String, Option<toml::Value>)])
         println!("{}", cfg.delegation_prompt);
     }
 
-    println!("Config actualizado en {}", path.display());
+    println!("Config updated at {}", path.display());
     Ok(())
 }
 
@@ -1600,11 +1599,11 @@ fn save_state(path: &Path, state: &GuardState) -> Result<()> {
     Ok(())
 }
 
-/// Modo hook del statusLine de Claude Code: lee el payload JSON que Claude
+/// statusLine hook mode for Claude Code: reads the JSON payload Claude
 /// Code injects on stdin on every render and persists it atomically
-/// (write a tmp + rename, para que el daemon nunca lea un archivo cortado)
-/// en statusline_json_path. Reemplaza al statusline_writer.sh externo:
-/// en ~/.claude/settings.json -> "statusLine": {"type": "command",
+/// (write a tmp + rename, so the daemon never reads a truncated file)
+/// into statusline_json_path. Replaces the external statusline_writer.sh:
+/// in ~/.claude/settings.json -> "statusLine": {"type": "command",
 /// "command": "climax --write-statusline"}.
 /// Prints nothing to stdout: Claude Code might use that output as the
 /// statusline content.
@@ -1630,13 +1629,13 @@ fn write_statusline(config: &Config) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────
-// Auto-install del hook statusLine en el settings.json de Claude Code
+// Auto-install of the statusLine hook in the Claude Code settings.json
 // ─────────────────────────────────────────────
 
-/// El comando exacto que el hook debe tener para considerarse "de climax".
+/// The exact command the hook must have to be considered "climax's".
 const STATUSLINE_HOOK_COMMAND: &str = "climax --write-statusline";
 
-/// Ruta del settings.json de usuario de Claude Code. Respeta
+/// Path of the user Claude Code settings.json. Respects
 /// CLAUDE_CONFIG_DIR if set; otherwise ~/.claude/settings.json.
 fn claude_settings_path(config: &Config) -> PathBuf {
     if let Some(p) = &config.claude_settings_path {
@@ -1656,9 +1655,9 @@ enum HookState {
     Present,
     /// The settings file does not exist.
     NoSettings,
-    /// Existe pero sin statusLine.
+    /// Exists but without statusLine.
     Missing,
-    /// El statusLine apunta a otro comando: no se pisa.
+    /// The statusLine points to another command: never overwritten.
     Other,
     /// The file exists but is not valid JSON.
     Invalid,
@@ -1690,10 +1689,10 @@ fn hook_state(settings: &Path) -> HookState {
     }
 }
 
-/// Instala el statusLine hook en settings.json preservando el resto del
-/// contenido. Escribe con tmp+rename y saca un backup previo
-/// (settings.json.climax.bak) la primera vez. Falla sin tocar nada si el
-/// existing file is not valid JSON.
+/// Installs the statusLine hook in settings.json preserving the rest of
+/// the content. Writes with tmp+rename and makes a backup first
+/// (settings.json.climax.bak) the first time. Fails without touching
+/// anything if the existing file is not valid JSON.
 fn install_statusline_hook(settings: &Path) -> Result<bool> {
     let mut value = if settings.exists() {
         let raw = fs::read_to_string(settings)
@@ -1706,7 +1705,7 @@ fn install_statusline_hook(settings: &Path) -> Result<bool> {
 
     let obj = value
         .as_object_mut()
-        .context("settings.json no es un objeto JSON")?;
+        .context("settings.json is not a JSON object")?;
     match obj.get("statusLine") {
         None => {}
         Some(sl) => {
@@ -1729,8 +1728,8 @@ fn install_statusline_hook(settings: &Path) -> Result<bool> {
         let backup = PathBuf::from(format!("{}.climax.bak", settings.display()));
         if !backup.exists() {
             fs::copy(settings, &backup)
-                .with_context(|| format!("backup en {}", backup.display()))?;
-            info!("Backup de settings.json creado en {}", backup.display());
+                .with_context(|| format!("backing up {}", backup.display()))?;
+            info!("settings.json backup created at {}", backup.display());
         }
     }
     if let Some(parent) = settings.parent() {
@@ -1743,7 +1742,7 @@ fn install_statusline_hook(settings: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Punto de entrada del auto-install al arrancar el daemon.
+/// Entry point of the auto-install when the daemon starts.
 /// With dry_run it only reports what it would do, touching nothing.
 fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
     if !config.install_statusline_hook {
@@ -1752,7 +1751,7 @@ fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
     }
     let settings = claude_settings_path(config);
     match hook_state(&settings) {
-        HookState::Present => info!("Hook statusLine ya configurado en {}", settings.display()),
+        HookState::Present => info!("statusLine hook already configured at {}", settings.display()),
         HookState::Other => warn!(
             "Claude Code statusLine points to another command in {}; \
              leaving it alone. If you intend to use climax as the quota \
@@ -1775,7 +1774,7 @@ fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
             match install_statusline_hook(&settings) {
                 Ok(true) => info!("StatusLine hook installed at {}", settings.display()),
                 Ok(false) => info!("StatusLine hook was already there ({})", settings.display()),
-                Err(e) => warn!("No se pudo instalar el hook: {:#}", e),
+                Err(e) => warn!("Could not install the hook: {:#}", e),
             }
         }
     }
@@ -1788,7 +1787,7 @@ fn wait_duration(reset_at: i64, margin_secs: u64) -> Duration {
 }
 
 // ─────────────────────────────────────────────
-// Servicio systemd de usuario (--install / --uninstall)
+// User systemd service (--install / --uninstall)
 // ─────────────────────────────────────────────
 
 const SERVICE_UNIT_NAME: &str = "climax.service";
@@ -1804,7 +1803,7 @@ fn user_systemd_dir() -> PathBuf {
 }
 
 /// Stable path where climax copies itself when installed as a
-/// servicio: $XDG_BIN_HOME, $XDG_DATA_HOME/bin, o ~/.local/bin.
+/// service: $XDG_BIN_HOME, $XDG_DATA_HOME/bin, or ~/.local/bin.
 fn executable_install_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_BIN_HOME") {
         return PathBuf::from(dir).join("climax");
@@ -1817,17 +1816,17 @@ fn executable_install_path() -> PathBuf {
         .join(".local/bin/climax")
 }
 
-/// Copia el binario en ejecución a `path` (como archivo real, no symlink)
-/// para que el servicio y el hook no dependan de dónde viva el código
-/// fuente. No-op si ya está ahí. Devuelve true si copió.
+/// Copies the running binary to `path` (as a real file, not a symlink)
+/// so the service and the hook don't depend on where the source code
+/// lives. No-op if it's already there. Returns true if it copied.
 fn self_install_to(path: &Path) -> Result<bool> {
     let src = std::env::current_exe().context("resolving the running binary")?;
     let src = fs::canonicalize(&src).unwrap_or(src);
 
     if let Ok(dst) = fs::canonicalize(path) {
-        // Skip solo si el destino YA ES un archivo real idéntico (un
-        // symlink no basta: hay que materializar la copia para que el
-        // servicio no dependa de la ubicación del proyecto).
+        // Skip only if the destination is ALREADY an identical real file
+        // (a symlink is not enough: the copy must be materialized so the
+        // service doesn't depend on the project location).
         if dst == src && !path.is_symlink() {
             return Ok(false);
         }
@@ -1837,11 +1836,11 @@ fn self_install_to(path: &Path) -> Result<bool> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     if path.exists() {
-        fs::remove_file(path).with_context(|| format!("reemplazando {}", path.display()))?;
+        fs::remove_file(path).with_context(|| format!("replacing {}", path.display()))?;
     }
-    fs::copy(&src, path).with_context(|| format!("copiando a {}", path.display()))?;
+    fs::copy(&src, path).with_context(|| format!("copying to {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("chmod +x {}", path.display()))?;
+        .with_context(|| format!("chmod +x on {}", path.display()))?;
     Ok(true)
 }
 
@@ -1860,11 +1859,11 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Instala climax como servicio de usuario de systemd con autorun en boot
-/// (WantedBy=default.target: arranca al login; con `loginctl enable-linger`
-/// también sin sesión abierta). Idempotente: en cada corrida regraba el unit
-/// apuntando al binario actual, recarga systemd y reinicia el servicio.
-/// Solo Linux/systemd: en macOS/otros se usa el binario directo (daemon).
+/// Installs climax as a systemd user service with boot autorun
+/// (WantedBy=default.target: starts at login; with `loginctl enable-linger`
+/// also without an open session). Idempotent: each run rewrites the unit
+/// pointing to the current binary, reloads systemd and restarts the service.
+/// Linux/systemd only: on macOS/others use the direct binary (daemon).
 fn install_service() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!(
@@ -1885,7 +1884,7 @@ fn install_service() -> Result<()> {
     let exe = if bin_path.exists() {
         bin_path.clone()
     } else {
-        let exe = std::env::current_exe().context("resolviendo la ruta del binario")?;
+        let exe = std::env::current_exe().context("resolving the binary path")?;
         fs::canonicalize(&exe).unwrap_or(exe)
     };
     let exe_str = exe.display().to_string();
@@ -1924,7 +1923,7 @@ fn install_service() -> Result<()> {
     run_systemctl(&["--user", "enable", SERVICE_UNIT_NAME])?;
     println!("Enabled for boot (systemctl --user enable)");
 
-    // Autorun sin login (boot): linger es best-effort, no crítico.
+    // Login-less autorun (boot): linger is best-effort, not critical.
     if let Ok(env_user) = std::env::var("USER") {
         match std::process::Command::new("loginctl")
             .args(["enable-linger", &env_user])
@@ -1950,13 +1949,13 @@ fn install_service() -> Result<()> {
     );
 
     println!();
-    println!("Estado     : systemctl --user status climax.service");
+    println!("Status     : systemctl --user status climax.service");
     println!("Logs       : journalctl --user -u climax.service -f");
     println!("Uninstall : climax --uninstall");
     Ok(())
 }
 
-/// Detiene, deshabilita y elimina el unit del servicio. Idempotente:
+/// Stops, disables and removes the service unit. Idempotent:
 /// if it was not installed, reports and exits without error.
 fn uninstall_service() -> Result<()> {
     let unit_path = user_systemd_dir().join(SERVICE_UNIT_NAME);
@@ -2005,7 +2004,7 @@ fn print_status(info: &RateInfo, config: &Config) {
     woken.sort_by(|a, b| a.0.cmp(b.0));
     let render = |v: &Vec<(&String, &i64)>| {
         if v.is_empty() {
-            painted("(ninguna todavía)", YELLOW)
+            painted("(none yet)", YELLOW)
         } else {
             painted(
                 &v.iter()
@@ -2056,7 +2055,7 @@ fn print_status(info: &RateInfo, config: &Config) {
             }
         );
     } else {
-        println!("resets_at      : (desconocido)");
+        println!("resets_at      : (unknown)");
     }
     println!(
         "delegation_sent: {}",
