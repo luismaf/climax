@@ -36,7 +36,7 @@ fn painted(s: &str, code: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     /// Porcentaje de uso que dispara la delegación y el monitoreo fino
-    /// cada 5s (default 85). Se alcanza con o sin resets_at en el hook.
+    /// cada 5s (default 90). Se alcanza con o sin resets_at en el hook.
     #[serde(default = "default_threshold")]
     threshold_pct: f64,
     /// Segundos antes del bloqueo para inyectar el aviso (default 300s = 5 min)
@@ -111,7 +111,7 @@ struct Config {
 }
 
 fn default_threshold() -> f64 {
-    85.0
+    90.0
 }
 fn default_warning_lead() -> u64 {
     300
@@ -261,7 +261,7 @@ const AFTER_HELP: &str = r#"MODES (mutually exclusive; no flags = STATUS):
                     (default: on). Only meaningful with several agents.
   -o, --no-all        Resume/delegate ONLY to the pinned herdr_agent_target
                     (or the first detected one). Opposite of -a.
-  -p, --percent     % of usage that fires the delegation (default 85;
+  -p, --percent     % of usage that fires the delegation (default 90;
                     alias --threshold; applies with or without resets_at).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
   -s, --status      Show current state (read-only, doesn't touch anything).
@@ -303,7 +303,7 @@ CONFIGURATION (write the TOML with these flags; the daemon hot-reloads):
                             danger zone >=threshold it polls every 5s).
       --margin <secs>       safety_margin_secs   (default 15, post-reset).
       --warning <secs>      warning_lead_time_secs (default 300).
-      -p, --percent <pct>     % de uso que dispara la delegación (default 85;
+      -p, --percent <pct>     % de uso que dispara la delegación (default 90;
                     alias --threshold; se cumple haya o no resets_at).
       --forced-reset <epoch>  Force the reset window ("null" clears).
       --herdr <bin>         herdr binary (default: PATH / ~/.local/bin).
@@ -428,12 +428,12 @@ struct Cli {
     warning: Option<u64>,
 
     /// % de uso que dispara la delegación (y el monitoreo fino cada 5s).
-    /// Se alcanza con o sin resets_at en el JSON del hook (default 85).
+    /// Se alcanza con o sin resets_at en el JSON del hook (default 90).
     #[arg(long, value_name = "PCT")]
     threshold: Option<f64>,
 
     /// Same as --threshold, with a short flag: % of usage that fires
-    /// the delegation prompt (default 85).
+    /// the delegation prompt (default 90).
     #[arg(short = 'p', long = "percent", value_name = "PCT")]
     percent: Option<f64>,
 
@@ -846,7 +846,7 @@ async fn run_once(
         }
     }
 
-    // Zona de peligro: con used >= threshold (default 85%) se monitorea
+    // Zona de peligro: con used >= threshold (default 90%) se monitorea
     // cada 5s en vez de cada poll_interval_secs, para no pisarte la
     // ventana de aviso.
     if info.used_pct >= config.threshold_pct {

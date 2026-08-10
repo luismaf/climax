@@ -21,7 +21,7 @@ Code shouldn't wait for your quota. Other agents waiting in the same
 herdr shouldn't wait for you either.
 
 When DELEGATION is on, right before the window ends (it never sleeps
-through the warning window, and monitors every 5s once usage >= 85%),
+through the warning window, and monitors every 5s once usage >= 90%),
 climax injects one last instruction into **every alive `claude`-kind
 agent** (or only the pinned one with `--no-all`):
 
@@ -162,7 +162,7 @@ Every setting is a flag that writes the TOML at `~/.config/climax/config.toml`
 | `--poll <secs>` | `poll_interval_secs` | `10` (5s inside the danger zone, >= threshold) |
 | `--margin <secs>` | `safety_margin_secs` | `15` |
 | `--warning <secs>` | `warning_lead_time_secs` | `300` |
-| `-p, --percent <pct>` | `threshold_pct` | `85` (fires delegation at this %, with or without `resets_at`; alias `--threshold`) |
+| `-p, --percent <pct>` | `threshold_pct` | `90` (fires delegation at this %, with or without `resets_at`; alias `--threshold`) |
 | `--forced-reset <epoch>` | `forced_resets_at` | — |
 | `--herdr <bin>` | `herdr_bin` | `herdr` from PATH |
 | `--session <name>` | `herdr_session` | — |
