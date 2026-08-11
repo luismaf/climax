@@ -89,6 +89,10 @@ It detects your system and does the right thing:
 
 Whatever the method, it never adds a service or touches your config — the
 systemd service (boot autorun) is always opt-in with `climax --install`.
+`--install` only writes the unit file pointing at the binary the installer
+put in place (it never copies itself around), and the daemon, on every
+start, makes sure the statusLine hook and the config file exist, creating
+them if missing — so it boots clean in any situation.
 
 **Ubuntu / Debian:** grab `climax_<version>_amd64.deb` (or `arm64`) from
 the [releases page](https://github.com/luismaf/climax/releases):
@@ -115,23 +119,31 @@ makepkg -si
 
 ```bash
 climax --install    # systemd user service, boot autorun (explicit, always)
-climax              # the whole picture at a glance (status is the default)
-climax --start      # run the daemon in the foreground
+climax              # start the daemon (via the service when installed)
+climax -s           # just look: read-only status, never starts anything
 climax -d           # turn DELEGATION on (the star)
 ```
 
 Running the daemon never installs anything but the Claude Code hook.
-The service is always your call.
+The service is always your call. When the service is installed, `climax`
+and `climax -z` start it and return; without it they run the guard in
+the foreground.
 
 ## Usage
 
 ```
-MODES (mutually exclusive; no flags = STATUS):
+MODES (mutually exclusive; no flags = DAEMON):
 
-  (no flags)        Status: current state at a glance (quota, window,
-                    delegation, hook, agent states). Read-only.
-  --start           Daemon: watches your quota 24/7, warns before the
-                    block, and auto-resumes the agent(s) at the reset.
+  (no flags)        Start the daemon AND print the full status first.
+                    When the systemd service is installed it starts the
+                    service and returns; otherwise it watches your quota
+                    24/7 in the foreground (warns before the block and
+                    auto-resumes the agent(s) at the reset).
+  -z, --start       Explicit daemon start (same as no flags).
+  -s, --status      Read-only status: quota, window, delegation, hook,
+                    agent states, and whether climax is ON or OFF.
+  -q, --stop        Stop the daemon (the systemd service, or the daemon
+                    process). Prints the full status after.
   -d, --delegate[=MSG]
                     Turn the DELEGATION on (writes the config file).
                     MSG = custom delegation message, or pass it as
@@ -140,21 +152,24 @@ MODES (mutually exclusive; no flags = STATUS):
   -n, --no-delegate Turn the DELEGATION off (default).
   -t, --target      Watch ONLY that herdr agent/pane ("null" = all).
   -c, --config      Path to the TOML config (default: ~/.config/climax/config.toml).
-  -s, --stop        Stop the running daemon (service) without uninstalling it.
-  -l, --list        List every alive 'claude' panel (target/pane_id), one per line.
       --rehearsal    Rehearsal without touching herdr or sending prompts.
 ```
 
 Examples:
 
 ```bash
-climax                    # status (the default; quota + delegation + hook + agents)
-climax --start            # daemon in the foreground (what the service runs)
+climax                    # start the daemon (service) AND show the full status
+climax -s                 # read-only status (ON/OFF + quota + hook + agents)
+climax -z                 # explicit daemon start (same as no flags)
+climax -q                 # stop the daemon, then show the status
 climax -d                 # DELEGATION on: hand over the work before the wall
 climax -t w5:p2           # watch only that agent
 climax -t null            # back to watching every claude agent
 climax --rehearsal        # rehearsal, no side effects
 ```
+
+`--start`, `--stop`, `--install` and `--uninstall` all print the full status
+when they finish, so you always see whether climax ended up ON or OFF.
 
 ## Configuration
 
@@ -185,8 +200,8 @@ Use `null` to clear any optional value: `climax -t null`.
 
 Query commands for scripts and other apps (no config written):
 
-- `climax` (no flags) — human-readable status (the default action), or
-  `climax -s` / `climax --stop` — stops the running daemon service.
+- `climax -s` — human-readable status (starts with `climax : ON/OFF`, so you
+  always know whether the guard is actually running).
 - `climax -p` — prints the current usage % as a plain number (e.g. `100.0`);
   with a number (`climax -p 85`) it sets the threshold instead.
 - `climax -t` — prints the targets that would be resumed/delegated, one per
@@ -218,9 +233,15 @@ Force a different window (stale hook, several agents, or simulation) with
 ## Uninstall
 
 ```bash
-climax --uninstall     # removes the service (the binary stays; the hook keeps working)
+climax --uninstall     # removes ONLY the systemd service
 rm ~/.local/bin/climax # remove the binary
 ```
+
+`--uninstall` never touches your Claude Code settings, the config or the
+binary: the statusLine hook and the config are kept (a bare `climax` runs
+the daemon manually again, re-creating anything missing). Removing the
+service, the hook, the config and the binary together is a full cleanup —
+the service is the only part climax manages itself.
 
 ## License
 

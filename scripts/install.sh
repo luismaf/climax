@@ -170,6 +170,6 @@ case "$BRANCH" in
 esac
 
 echo
-echo "Try it:        climax"
+echo "Try it:        climax -s"
 echo "Background:    climax --install   (systemd user service, boot autorun)"
 echo "Remove it:     climax --uninstall (service) · rm ~/.local/bin/climax (binary)"

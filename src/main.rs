@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -235,9 +234,13 @@ struct RateInfo {
 // ─────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────
-const AFTER_HELP: &str = r#"MODES (no flags = STATUS, read-only):
-  --start            daemon · --rehearsal  dry run (no effects)
-  --write-statusline Claude Code hook (stdin JSON -> cache) · --install/--uninstall/-s, --stop  service
+const AFTER_HELP: &str = r#"MODES:
+  (no flags)         start the daemon AND print the status (default)
+  -z, --start        explicit daemon start (same as no flags): via the
+                     systemd service when installed, else in the foreground
+  -s, --status       read-only status (never starts the daemon)
+  -q, --stop         stop the daemon · --rehearsal  dry run (no effects)
+  --write-statusline Claude Code hook (stdin JSON -> cache) · --install/--uninstall service
   -d[=MSG] / -n      DELEGATION on (custom message) / off · -t <name> pin agent
   -a / -o            resume+delegate ALL claude agents / only the pin
 
@@ -247,10 +250,11 @@ its work over to the other herdr agents; at the reset the auto-resume wakes them
 lead that the agent is back).
 
 EXAMPLES:
-  climax                 Status        climax -d 'delegate now'    Delegation on
-  climax --start         Daemon        climax -r 'continue'        Custom resume
-  climax -t w5:p2        Watch one     climax --rehearsal          Dry run
-  climax -p              Usage % (machine)  climax -t/-l            List targets/panels
+  climax                 Start daemon + status    climax -s             Status (read-only)
+  climax -z              Start daemon (explicit)  climax -q             Stop daemon
+  climax -d 'delegate now'  Delegation on         climax -r 'continue'  Custom resume
+  climax -t w5:p2        Watch one                climax --rehearsal    Dry run
+  climax -p              Usage % (machine)        climax -t/-l          List targets/panels
   climax --blocked       0 or the blocked target(s) (for scripts/apps)
 
 NOTES:
@@ -275,12 +279,12 @@ struct Cli {
     #[arg(short, long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Stop the running daemon (systemd user service) without uninstalling it.
-    #[arg(short = 's', long = "stop")]
-    stop: bool,
+    /// Show status: % used, reset, window, agents (read-only).
+    #[arg(short = 's', long)]
+    status: bool,
 
-    /// Machine-readable status for scripts/apps: prints "0" when nothing
-    /// is blocked, or the blocked target(s) (one per line).
+    /// Machine-readable hard-limit status for scripts/apps: prints
+    /// "1" when blocked, "0" otherwise.
     #[arg(long = "blocked")]
     blocked: bool,
 
@@ -288,11 +292,24 @@ struct Cli {
     #[arg(long = "rehearsal")]
     dry_run: bool,
 
-    /// Start the daemon (what a bare `climax` used to do): watches your
-    /// quota 24/7, warns before the block and auto-resumes at the reset.
-    /// With no flags climax now shows the status instead.
-    #[arg(long = "start")]
+    /// Start the daemon (same as a bare `climax`): watches your quota
+    /// 24/7, warns before the block and auto-resumes at the reset. When
+    /// the systemd user service is installed it starts that service and
+    /// returns (no foreground loop); otherwise it prints the full status
+    /// and runs in the foreground.
+    #[arg(short = 'z', long = "start")]
     start: bool,
+
+    /// Stop the running climax daemon (the systemd user service when it is
+    /// installed, otherwise the daemon process). Prints the full status after.
+    #[arg(short = 'q', long = "stop")]
+    stop: bool,
+
+    /// Run the guard loop unconditionally in this process (no systemd
+    /// delegation). Internal: used by the generated service unit, whose
+    /// process must never hand the work back to systemd.
+    #[arg(long, hide = true)]
+    daemon_loop: bool,
 
     /// Turn DELEGATION on (writes to the config file, hot-reloaded).
     /// The custom delegation message can be given inline with `-d=MSG`
@@ -338,10 +355,14 @@ struct Cli {
     write_statusline: bool,
 
     /// Install the systemd user service (boot autorun) and start it.
+    /// Writes only the unit file: the binary stays where the installer
+    /// put it (climax never copies itself). Prints the full status after.
     #[arg(long = "install")]
     install_service: bool,
 
-    /// Uninstall the systemd service (keeps the binary for the hook).
+    /// Uninstall the systemd service. Removes ONLY the service: the
+    /// statusLine hook, the config and the binary are kept. Prints the
+    /// full status after.
     #[arg(long = "uninstall")]
     uninstall_service: bool,
 
@@ -410,7 +431,7 @@ struct Cli {
 // ─────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Don't panic when stdout is a closed pipe (e.g. `climax --blocked | head`).
+    // Don't panic when stdout is a closed pipe (e.g. `climax -s | head`).
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -427,26 +448,33 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.install_service || cli.uninstall_service || cli.stop {
+    let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
+
+    if cli.install_service || cli.uninstall_service {
         if cli.install_service && cli.uninstall_service {
             bail!("--install and --uninstall are mutually exclusive");
         }
-        if cli.stop && (cli.install_service || cli.uninstall_service) {
-            bail!("--stop doesn't combine with --install/--uninstall");
+        if cli.status || cli.start || cli.stop || cli.dry_run || cli.write_statusline {
+            bail!("--install/--uninstall don't combine with other modes");
         }
-        if cli.start || cli.dry_run || cli.write_statusline {
-            bail!("--install/--uninstall/--stop don't combine with --start/--rehearsal/--write-statusline");
-        }
-        return if cli.stop {
-            stop_service()
-        } else if cli.install_service {
-            install_service()
+        if cli.install_service {
+            install_service()?;
         } else {
-            uninstall_service()
-        };
+            uninstall_service()?;
+        }
+        println!();
+        print_full_status(&load_config_from(&config_path)?).await?;
+        return Ok(());
     }
 
-    let config_path: PathBuf = cli.config.clone().unwrap_or_else(default_config_path);
+    if [cli.status, cli.start, cli.stop]
+        .iter()
+        .filter(|&&on| on)
+        .count()
+        > 1
+    {
+        bail!("--status, --start and --stop are mutually exclusive");
+    }
 
     // `-p` / `--percent` without a number: report the current usage %.
     if cli.percent.as_deref() == Some("") {
@@ -512,8 +540,10 @@ async fn main() -> Result<()> {
     // Direct config flags (write to the TOML, hot-reloaded).
     let settings = collect_settings(&cli)?;
     if !settings.is_empty() {
-        if cli.start || cli.dry_run || cli.write_statusline {
-            bail!("config flags don't combine with --start/--rehearsal/--write-statusline");
+        if cli.status || cli.start || cli.stop || cli.dry_run || cli.write_statusline {
+            bail!(
+                "config flags don't combine with --status/--start/--stop/--rehearsal/--write-statusline"
+            );
         }
         apply_config_settings(&config_path, &settings)?;
         return Ok(());
@@ -529,74 +559,72 @@ async fn main() -> Result<()> {
     // Polling interval hard floor: never under 5s, whatever the config says.
     clamp_poll(&mut config);
 
-    let daemon = cli.start || cli.dry_run;
-    if !daemon {
-        // No flags: status is the default action.
-        let info = gather_rate_info(&config)?;
-        print_status(&info, &config);
-        println!(
-            "delegation     : {}",
-            if config.delegation {
-                painted("enabled", GREEN)
-            } else {
-                painted("disabled (default)", RED)
-            }
-        );
-        if let Some(forced) = config.forced_resets_at {
-            println!(
-                "resets_forced  : {} (forced window; ignores the hook resets_at)",
-                forced
-            );
-        }
-        println!(
-            "statusline_hook: {}",
-            match hook_state(&claude_settings_path(&config)) {
-                HookState::Present => painted("installed", GREEN),
-                HookState::NoSettings => painted("no settings.json", YELLOW),
-                HookState::Missing => painted("missing (auto-install on daemon start)", YELLOW),
-                HookState::Other => painted("points to another command", RED),
-                HookState::Invalid => painted("invalid JSON", RED),
-            }
-        );
-        println!(
-            "wake_targets   : {}",
-            if config.resume_all {
-                painted(
-                    &format!(
-                        "ALL kind='{}' claude windows (-a/--all, default)",
-                        config.herdr_agent_kind
-                    ),
-                    GREEN,
-                )
-            } else {
-                painted("only the pinned herdr_agent_target (--no-all)", YELLOW)
-            }
-        );
-        match resolve_targets(&config).await {
-            Ok(targets) => {
-                println!("herdr_targets  : {}", targets.join(", "));
-                for t in &targets {
-                    match get_agent_status(&config, t).await {
-                        Ok(status) => {
-                            let code = match status.as_str() {
-                                "working" | "busy" => GREEN,
-                                "idle" | "free" | "waiting" => YELLOW,
-                                "queued" | "pending" => CYAN,
-                                _ => RED,
-                            };
-                            println!("  {t} : {}", painted(&status, code));
-                        }
-                        Err(e) => println!("  {t} : {}", painted(&format!("(error: {e:#})"), RED)),
-                    }
-                }
-            }
-            Err(e) => println!(
-                "herdr_targets  : {}",
-                painted(&format!("(not resolved: {e:#})"), RED)
-            ),
-        }
+    // `--stop`: stop the daemon (systemd service or the daemon process),
+    // then report the full status so you see it actually went off.
+    if cli.stop {
+        stop_daemon()?;
+        println!();
+        print_full_status(&config).await?;
         return Ok(());
     }
+
+    // Read-only status: the only mode that never touches the daemon.
+    if cli.status {
+        print_full_status(&config).await?;
+        return Ok(());
+    }
+
+    // Daemon mode (no flags, -z/--start or --rehearsal).
+    //
+    // A fresh start must not fail in any situation: make sure the config
+    // file exists (with defaults) and the statusLine hook is in place.
+    // Both are best-effort.
+    ensure_config(&config_path);
+    if let Err(e) = run_hook_install(&config, dry_run) {
+        warn!("Hook check/install: {:#}", e);
+    }
+
+    //
+    // If the systemd user service is installed, `climax` / `--start` hands
+    // the work to it and returns (the terminal is not occupied; the service
+    // runs the guard in the background). The service itself runs with
+    // --daemon-loop, so its process never delegates back to systemd.
+    // --rehearsal always stays foreground.
+    if !cli.dry_run && !cli.daemon_loop && user_systemd_dir().join(SERVICE_UNIT_NAME).exists() {
+        let was_active = is_service_active();
+        match run_systemctl(&["--user", "start", SERVICE_UNIT_NAME]) {
+            Ok(()) => {
+                // Only announce the start when it actually made a change
+                // (the service was down): if it was already running the
+                // message is just noise.
+                if !was_active {
+                    println!(
+                        "{}",
+                        painted(
+                            &format!(
+                                "Daemon started via systemd user service {}.",
+                                SERVICE_UNIT_NAME
+                            ),
+                            GREEN,
+                        )
+                    );
+                    println!();
+                }
+                print_full_status(&config).await?;
+                return Ok(());
+            }
+            Err(e) => warn!(
+                "Could not start the systemd user service ({:#}); \
+                 running the daemon in the foreground instead.",
+                e
+            ),
+        }
+    }
+
+    // Foreground daemon (no service, or the service could not be started):
+    // report the full status first, then run the guard loop.
+    print_full_status(&config).await?;
+    println!();
 
     info!("climax daemon started (JSON hook + herdr, no UI scraping)");
     info!(
@@ -606,10 +634,6 @@ async fn main() -> Result<()> {
         config.safety_margin_secs,
         config.herdr_agent_kind
     );
-
-    if let Err(e) = run_hook_install(&config, dry_run) {
-        warn!("Hook check/install: {:#}", e);
-    }
 
     if !resolve_path(&config.statusline_json_path).exists() {
         warn!(
@@ -1766,7 +1790,7 @@ enum HookState {
     Invalid,
 }
 
-/// Read-only inspection of the hook state (fitness for the status display).
+/// Read-only inspection of the hook state (fitness for --status).
 fn hook_state(settings: &Path) -> HookState {
     if !settings.exists() {
         return HookState::NoSettings;
@@ -1854,7 +1878,10 @@ fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
     }
     let settings = claude_settings_path(config);
     match hook_state(&settings) {
-        HookState::Present => info!("statusLine hook already configured at {}", settings.display()),
+        HookState::Present => debug!(
+            "statusLine hook already configured at {} (nothing to do)",
+            settings.display()
+        ),
         HookState::Other => warn!(
             "Claude Code statusLine points to another command in {}; \
              leaving it alone. If you intend to use climax as the quota \
@@ -1876,7 +1903,7 @@ fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
             }
             match install_statusline_hook(&settings) {
                 Ok(true) => info!("StatusLine hook installed at {}", settings.display()),
-                Ok(false) => info!("StatusLine hook was already there ({})", settings.display()),
+                Ok(false) => debug!("StatusLine hook was already there ({})", settings.display()),
                 Err(e) => warn!("Could not install the hook: {:#}", e),
             }
         }
@@ -1905,8 +1932,9 @@ fn user_systemd_dir() -> PathBuf {
     }
 }
 
-/// Stable path where climax copies itself when installed as a
-/// service: $XDG_BIN_HOME, $XDG_DATA_HOME/bin, or ~/.local/bin.
+/// Where the installer usually puts the binary: $XDG_BIN_HOME,
+/// $XDG_DATA_HOME/bin, or ~/.local/bin. climax itself never writes there
+/// (that is the installer's job); it is only referenced in messages.
 fn executable_install_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_BIN_HOME") {
         return PathBuf::from(dir).join("climax");
@@ -1917,34 +1945,6 @@ fn executable_install_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
         .join(".local/bin/climax")
-}
-
-/// Copies the running binary to `path` (as a real file, not a symlink)
-/// so the service and the hook don't depend on where the source code
-/// lives. No-op if it's already there. Returns true if it copied.
-fn self_install_to(path: &Path) -> Result<bool> {
-    let src = std::env::current_exe().context("resolving the running binary")?;
-    let src = fs::canonicalize(&src).unwrap_or(src);
-
-    if let Ok(dst) = fs::canonicalize(path) {
-        // Skip only if the destination is ALREADY an identical real file
-        // (a symlink is not enough: the copy must be materialized so the
-        // service doesn't depend on the project location).
-        if dst == src && !path.is_symlink() {
-            return Ok(false);
-        }
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("replacing {}", path.display()))?;
-    }
-    fs::copy(&src, path).with_context(|| format!("copying to {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("chmod +x on {}", path.display()))?;
-    Ok(true)
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
@@ -1964,9 +1964,11 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 
 /// Installs climax as a systemd user service with boot autorun
 /// (WantedBy=default.target: starts at login; with `loginctl enable-linger`
-/// also without an open session). Idempotent: each run rewrites the unit
-/// pointing to the current binary, reloads systemd and restarts the service.
-/// Linux/systemd only: on macOS/others use the direct binary (daemon).
+/// also without an open session). The unit points at the running binary:
+/// climax never copies itself anywhere — placing the binary where it
+/// belongs is the installer's job. Idempotent: each run rewrites the unit,
+/// reloads systemd and restarts the service. Linux/systemd only:
+/// on macOS/others use the direct binary (daemon).
 fn install_service() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!(
@@ -1974,22 +1976,13 @@ fn install_service() -> Result<()> {
              system run the daemon directly (e.g.: nohup climax --start &)"
         );
     }
-    let bin_path = executable_install_path();
-    match self_install_to(&bin_path) {
-        Ok(true) => println!("Binary installed {}", bin_path.display()),
-        Ok(false) => println!("Binary already up to date: {}", bin_path.display()),
-        Err(e) => println!(
-            "Warning: could not copy the binary ({:#}); the unit will use the current binary.",
-            e
-        ),
-    }
+    let exe = std::env::current_exe().context("resolving the binary path")?;
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    println!("Service will run: {}", exe.display());
 
-    let exe = if bin_path.exists() {
-        bin_path.clone()
-    } else {
-        let exe = std::env::current_exe().context("resolving the binary path")?;
-        fs::canonicalize(&exe).unwrap_or(exe)
-    };
+    // A fresh start must not fail: make sure the config file exists.
+    ensure_config(&default_config_path());
+
     let exe_str = exe.display().to_string();
     let exe_quoted = if exe_str.contains(' ') {
         format!("\"{}\"", exe_str.replace('"', r#"\""#))
@@ -2003,7 +1996,8 @@ fn install_service() -> Result<()> {
 
     let unit = format!(
         "# Generated by 'climax --install' — do not edit by hand; it is \
-         # regenerated on every install and the binary is copied to {}.\n\
+         # regenerated on every install. The binary is left where the \
+         # installer put it (climax never copies itself).\n\
          [Unit]\n\
          Description=Climax - Claude Code quota guard (JSON hook + herdr)\n\
          After=default.target\n\
@@ -2011,13 +2005,12 @@ fn install_service() -> Result<()> {
          [Service]\n\
          # User services start with a minimal PATH; without this they would \n         # not find herdr (or other ~/.local/bin tools).\n\
          Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-         ExecStart={exe_quoted} --start\n\
+         ExecStart={exe_quoted} --daemon-loop\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n",
-        bin_path.display()
+         WantedBy=default.target\n"
     );
     fs::write(&unit_path, unit).with_context(|| format!("writing {}", unit_path.display()))?;
     println!("Unit created: {}", unit_path.display());
@@ -2058,30 +2051,10 @@ fn install_service() -> Result<()> {
     Ok(())
 }
 
-/// Stops the running daemon (systemd user service). Idempotent: if the
-/// service was never installed (or already stopped), reports and exits
-/// without error.
-fn stop_service() -> Result<()> {
-    match run_systemctl(&["--user", "stop", SERVICE_UNIT_NAME]) {
-        Ok(()) => {
-            println!("climax.service stopped.");
-            println!("Start it again with: climax --start (or systemctl --user start climax.service)");
-        }
-        Err(e) => {
-            let msg = format!("{e:#}");
-            // systemd says "not loaded" when the unit was never started/installed.
-            if msg.contains("not loaded") || msg.contains("not found") {
-                println!("climax.service is not running (install it first with: climax --install).");
-            } else {
-                return Err(e);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Stops, disables and removes the service unit. Idempotent:
 /// if it was not installed, reports and exits without error.
+/// Only the service is removed: the statusLine hook, the config and the
+/// binary are kept (the daemon re-creates the hook/config if needed).
 fn uninstall_service() -> Result<()> {
     let unit_path = user_systemd_dir().join(SERVICE_UNIT_NAME);
 
@@ -2110,9 +2083,273 @@ fn uninstall_service() -> Result<()> {
 
     println!("climax.service uninstalled.");
     println!(
-        "Note: the binary in {} is kept (the statusLine hook keeps working).",
+        "Note: the statusLine hook, the config and the binary ({}) are \
+         kept. A bare `climax` runs the daemon manually again; remove \
+         the binary by hand for a full cleanup.",
         executable_install_path().display()
     );
+    Ok(())
+}
+
+/// Ensures the config file exists with all the defaults, creating it (and
+/// its directory) when missing. Best-effort: the daemon runs on defaults
+/// anyway, so a failure is only a warning. Called on daemon start so a
+/// fresh install never fails for a missing config.
+fn ensure_config(config_path: &Path) {
+    if config_path.exists() {
+        return;
+    }
+    if let Some(parent) = config_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            warn!(
+                "Could not create the config directory {}: {:#}",
+                parent.display(),
+                e
+            );
+            return;
+        }
+    }
+    match toml::to_string_pretty(&Config::default()) {
+        Ok(text) => match fs::write(config_path, text) {
+            Ok(()) => info!("Created default config at {}", config_path.display()),
+            Err(e) => warn!(
+                "Could not create the default config at {}: {:#}",
+                config_path.display(),
+                e
+            ),
+        },
+        Err(e) => warn!("Could not serialize the default config: {:#}", e),
+    }
+}
+
+/// Whether the systemd user service is currently active (not just
+/// installed). Used to decide if starting it is a real change worth
+/// announcing. Returns None when systemd cannot be queried.
+fn is_service_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", SERVICE_UNIT_NAME])
+        .output()
+        .ok()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let s = s.trim();
+            s == "active" || s == "activating" || s == "reloading"
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the climax daemon is running and how it is tracked, for the
+/// status display. Prefers the systemd user service when the unit exists
+/// and is active; otherwise scans the process table for a climax daemon
+/// process (e.g. a bare `climax` started by hand).
+fn daemon_status() -> (bool, String) {
+    let unit_installed = user_systemd_dir().join(SERVICE_UNIT_NAME).exists();
+    let systemd_state = if unit_installed {
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-active", SERVICE_UNIT_NAME])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    } else {
+        None
+    };
+    let process = || climax_daemon_process().map(|(pid, mode)| {
+        let how = if mode.is_empty() {
+            format!("process pid {pid} (bare climax)")
+        } else {
+            format!("process pid {pid} (`climax {mode}`)")
+        };
+        how
+    });
+    match systemd_state.as_deref() {
+        Some(s @ ("active" | "activating" | "reloading")) => (
+            true,
+            format!("systemd user service `{SERVICE_UNIT_NAME}` ({s})"),
+        ),
+        Some(s) => match process() {
+            Some(how) => (
+                true,
+                format!("{how}; service `{SERVICE_UNIT_NAME}` is {s}"),
+            ),
+            None => (
+                false,
+                format!("systemd user service `{SERVICE_UNIT_NAME}` is {s}"),
+            ),
+        },
+        None => match process() {
+            Some(how) => (true, how),
+            None if unit_installed => (
+                false,
+                "installed service is not running and no daemon process".to_string(),
+            ),
+            None => (false, "no daemon running".to_string()),
+        },
+    }
+}
+
+/// Finds a running climax daemon process (start mode), returning its pid
+/// and the CLI mode. Ignores the current process. A bare `climax` (no
+/// arguments) is also a daemon, since a flagless run starts the guard.
+fn climax_daemon_process() -> Option<(u32, String)> {
+    let self_pid = std::process::id();
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .collect();
+        if args.is_empty() {
+            continue;
+        }
+        let exe = String::from_utf8_lossy(args[0]);
+        let bin = Path::new(&*exe)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !bin.contains("climax") {
+            continue;
+        }
+        let has = |flag: &str| args.contains(&flag.as_bytes());
+        if has("--start") || has("-z") {
+            let mode = if has("--start") { "--start" } else { "-z" };
+            return Some((pid, mode.to_string()));
+        }
+        if args.len() == 1 {
+            return Some((pid, String::new()));
+        }
+    }
+    None
+}
+
+/// Stops the running climax daemon: the systemd user service when the unit
+/// is installed, plus a SIGTERM to any leftover daemon process. Idempotent.
+fn stop_daemon() -> Result<()> {
+    let unit_installed = user_systemd_dir().join(SERVICE_UNIT_NAME).exists();
+    if unit_installed {
+        match run_systemctl(&["--user", "stop", SERVICE_UNIT_NAME]) {
+            Ok(()) => println!("Daemon stopped (systemd user service {}).", SERVICE_UNIT_NAME),
+            Err(e) => println!("(already stopped?) {:#}", e),
+        }
+    }
+    if let Some((pid, mode)) = climax_daemon_process() {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        if mode.is_empty() {
+            println!("Daemon process stopped (SIGTERM sent to pid {pid}).");
+        } else {
+            println!(
+                "Daemon process stopped (SIGTERM sent to pid {pid}, `climax {mode}`)."
+            );
+        }
+    } else if !unit_installed {
+        println!("No climax daemon is running (nothing to stop).");
+    }
+    Ok(())
+}
+
+/// Prints the full status: climax ON/OFF (the most important item), the
+/// quota/window data, delegation, hook, wake targets and the per-agent
+/// states. Used by -s/--status and reported after start/stop/install/
+/// uninstall.
+async fn print_full_status(config: &Config) -> Result<()> {
+    let (daemon_on, daemon_how) = daemon_status();
+    println!(
+        "{:<15}: {}",
+        "climax",
+        if daemon_on {
+            painted(&format!("ON — {daemon_how}"), GREEN)
+        } else {
+            painted(&format!("OFF — {daemon_how}"), RED)
+        }
+    );
+
+    let info = match gather_rate_info(config) {
+        Ok(i) => i,
+        Err(e) => {
+            println!(
+                "{:<15}: {}",
+                "statusline",
+                painted(&format!("(read error: {e:#})"), RED)
+            );
+            RateInfo::default()
+        }
+    };
+    print_status(&info, config);
+    println!(
+        "{:<15}: {}",
+        "delegation",
+        if config.delegation {
+            painted("enabled", GREEN)
+        } else {
+            painted("disabled (default)", RED)
+        }
+    );
+    if let Some(forced) = config.forced_resets_at {
+        println!(
+            "{:<15}: {} (forced window; ignores the hook resets_at)",
+            "resets_forced", forced
+        );
+    }
+    println!(
+        "{:<15}: {}",
+        "statusline_hook",
+        match hook_state(&claude_settings_path(config)) {
+            HookState::Present => painted("installed", GREEN),
+            HookState::NoSettings => painted("no settings.json", YELLOW),
+            HookState::Missing => painted("missing (auto-install on daemon start)", YELLOW),
+            HookState::Other => painted("points to another command", RED),
+            HookState::Invalid => painted("invalid JSON", RED),
+        }
+    );
+    println!(
+        "{:<15}: {}",
+        "wake_targets",
+        if config.resume_all {
+            painted(
+                &format!(
+                    "ALL kind='{}' claude windows (-a/--all, default)",
+                    config.herdr_agent_kind
+                ),
+                GREEN,
+            )
+        } else {
+            painted("only the pinned herdr_agent_target (--no-all)", YELLOW)
+        }
+    );
+    match resolve_targets(config).await {
+        Ok(targets) => {
+            println!("{:<15}: {}", "herdr_targets", targets.join(", "));
+            for t in &targets {
+                match get_agent_status(config, t).await {
+                    Ok(status) => {
+                        let code = match status.as_str() {
+                            "working" | "busy" => GREEN,
+                            "idle" | "free" | "waiting" => YELLOW,
+                            "queued" | "pending" => CYAN,
+                            _ => RED,
+                        };
+                        println!("  {t} : {}", painted(&status, code));
+                    }
+                    Err(e) => println!("  {t} : {}", painted(&format!("(error: {e:#})"), RED)),
+                }
+            }
+        }
+        Err(e) => println!(
+            "{:<15}: {}",
+            "herdr_targets",
+            painted(&format!("(not resolved: {e:#})"), RED)
+        ),
+    }
     Ok(())
 }
 
