@@ -628,6 +628,7 @@ async fn main() -> Result<()> {
             // hanging foreground process.
             match install_service() {
                 Ok(()) => {
+                    println!();
                     print_full_status(&config).await?;
                     return Ok(());
                 }
@@ -2158,11 +2159,11 @@ fn is_service_active() -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the climax daemon is running and how it is tracked, for the
-/// status display. Prefers the systemd user service when the unit exists
-/// and is active; otherwise scans the process table for a climax daemon
-/// process (e.g. a bare `climax` started by hand).
-fn daemon_status() -> (bool, String) {
+/// Whether the climax daemon is running, for the status display. Prefers
+/// the systemd user service when the unit exists and is active; otherwise
+/// scans the process table for a climax daemon process (e.g. a bare
+/// `climax` started by hand).
+fn daemon_status() -> bool {
     let unit_installed = user_systemd_dir().join(SERVICE_UNIT_NAME).exists();
     let systemd_state = if unit_installed {
         std::process::Command::new("systemctl")
@@ -2173,37 +2174,10 @@ fn daemon_status() -> (bool, String) {
     } else {
         None
     };
-    let process = || climax_daemon_process().map(|(pid, mode)| {
-        let how = if mode.is_empty() {
-            format!("process pid {pid} (bare climax)")
-        } else {
-            format!("process pid {pid} (`climax {mode}`)")
-        };
-        how
-    });
     match systemd_state.as_deref() {
-        Some(s @ ("active" | "activating" | "reloading")) => (
-            true,
-            format!("systemd user service `{SERVICE_UNIT_NAME}` ({s})"),
-        ),
-        Some(s) => match process() {
-            Some(how) => (
-                true,
-                format!("{how}; service `{SERVICE_UNIT_NAME}` is {s}"),
-            ),
-            None => (
-                false,
-                format!("systemd user service `{SERVICE_UNIT_NAME}` is {s}"),
-            ),
-        },
-        None => match process() {
-            Some(how) => (true, how),
-            None if unit_installed => (
-                false,
-                "installed service is not running and no daemon process".to_string(),
-            ),
-            None => (false, "no daemon running".to_string()),
-        },
+        Some(s @ ("active" | "activating" | "reloading")) => true,
+        Some(_) => climax_daemon_process().is_some(),
+        None => climax_daemon_process().is_some(),
     }
 }
 
@@ -2282,29 +2256,23 @@ fn stop_daemon() -> Result<()> {
 /// states. Used by -s/--status and reported after start/stop/install/
 /// uninstall.
 async fn print_full_status(config: &Config) -> Result<()> {
-    let (daemon_on, daemon_how) = daemon_status();
+    let daemon_on = daemon_status();
     println!(
         "{:<15}: {}",
         "climax",
         if daemon_on {
-            painted(&format!("ON — {daemon_how}"), GREEN)
+            painted("ON", GREEN)
         } else {
-            painted(&format!("OFF — {daemon_how}"), RED)
+            painted("OFF", RED)
         }
     );
-    // Second line: is the systemd service installed or not (independent of
-    // whether it is currently running).
-    let unit_path = user_systemd_dir().join(SERVICE_UNIT_NAME);
     println!(
         "{:<15}: {}",
         "service",
-        if unit_path.exists() {
-            painted(
-                &format!("installed ({})", unit_path.display()),
-                GREEN,
-            )
+        if user_systemd_dir().join(SERVICE_UNIT_NAME).exists() {
+            painted("installed", GREEN)
         } else {
-            painted("not installed (bare `climax` or --start installs it)", YELLOW)
+            painted("not installed", YELLOW)
         }
     );
 

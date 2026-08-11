@@ -140,8 +140,8 @@ MODES (mutually exclusive; no flags = DAEMON):
                     and auto-resumes the agent(s) at the reset).
   -z, --start       Explicit daemon start (same as no flags).
   -s, --status      Read-only status: quota, window, delegation, hook,
-                    agent states, whether climax is ON/OFF, and whether
-                    the service is installed.
+                    agent states, and whether climax is ON/OFF (and how:
+                    the systemd service or a process).
   -q, --stop        Stop the daemon (the systemd service, or the daemon
                     process). Never uninstalls. Prints the full status.
   -d, --delegate[=MSG]
@@ -159,7 +159,7 @@ Examples:
 
 ```bash
 climax                    # start the daemon (installs it if needed) AND show the status
-climax -s                 # read-only status (ON/OFF + service installed? + quota + hook + agents)
+climax -s                 # read-only status (ON/OFF + quota + hook + agents)
 climax -z                 # explicit daemon start (same as no flags)
 climax -q                 # stop the daemon (service kept installed), then show the status
 climax -d                 # DELEGATION on: hand over the work before the wall
@@ -200,9 +200,8 @@ Use `null` to clear any optional value: `climax -t null`.
 
 Query commands for scripts and other apps (no config written):
 
-- `climax -s` — human-readable status (starts with `climax : ON/OFF` and
-  `service : installed/not installed`, so you always know whether the guard
-  is running and whether it is set up as a service).
+- `climax -s` — human-readable status (first line `climax : ON/OFF`, second
+  line always `service : installed / not installed`).
 - `climax -p` — prints the current usage % as a plain number (e.g. `100.0`);
   with a number (`climax -p 85`) it sets the threshold instead.
 - `climax -t` — prints the targets that would be resumed/delegated, one per
