@@ -118,16 +118,15 @@ makepkg -si
 ## Quick start
 
 ```bash
-climax --install    # systemd user service, boot autorun (explicit, always)
-climax              # start the daemon (via the service when installed)
+climax              # start the daemon (installs the service first if missing)
 climax -s           # just look: read-only status, never starts anything
 climax -d           # turn DELEGATION on (the star)
 ```
 
 Running the daemon never installs anything but the Claude Code hook.
 The service is always your call. When the service is installed, `climax`
-and `climax -z` start it and return; without it they run the guard in
-the foreground.
+and `climax -z` start it and return; if it is not installed, they install
+it first and then start it — never a hanging foreground process.
 
 ## Usage
 
@@ -135,15 +134,16 @@ the foreground.
 MODES (mutually exclusive; no flags = DAEMON):
 
   (no flags)        Start the daemon AND print the full status first.
-                    When the systemd service is installed it starts the
-                    service and returns; otherwise it watches your quota
-                    24/7 in the foreground (warns before the block and
-                    auto-resumes the agent(s) at the reset).
+                    Installs the systemd service first if it is missing,
+                    then starts it and returns; otherwise it watches your
+                    quota 24/7 in the foreground (warns before the block
+                    and auto-resumes the agent(s) at the reset).
   -z, --start       Explicit daemon start (same as no flags).
   -s, --status      Read-only status: quota, window, delegation, hook,
-                    agent states, and whether climax is ON or OFF.
+                    agent states, whether climax is ON/OFF, and whether
+                    the service is installed.
   -q, --stop        Stop the daemon (the systemd service, or the daemon
-                    process). Prints the full status after.
+                    process). Never uninstalls. Prints the full status.
   -d, --delegate[=MSG]
                     Turn the DELEGATION on (writes the config file).
                     MSG = custom delegation message, or pass it as
@@ -158,10 +158,10 @@ MODES (mutually exclusive; no flags = DAEMON):
 Examples:
 
 ```bash
-climax                    # start the daemon (service) AND show the full status
-climax -s                 # read-only status (ON/OFF + quota + hook + agents)
+climax                    # start the daemon (installs it if needed) AND show the status
+climax -s                 # read-only status (ON/OFF + service installed? + quota + hook + agents)
 climax -z                 # explicit daemon start (same as no flags)
-climax -q                 # stop the daemon, then show the status
+climax -q                 # stop the daemon (service kept installed), then show the status
 climax -d                 # DELEGATION on: hand over the work before the wall
 climax -t w5:p2           # watch only that agent
 climax -t null            # back to watching every claude agent
@@ -200,8 +200,9 @@ Use `null` to clear any optional value: `climax -t null`.
 
 Query commands for scripts and other apps (no config written):
 
-- `climax -s` — human-readable status (starts with `climax : ON/OFF`, so you
-  always know whether the guard is actually running).
+- `climax -s` — human-readable status (starts with `climax : ON/OFF` and
+  `service : installed/not installed`, so you always know whether the guard
+  is running and whether it is set up as a service).
 - `climax -p` — prints the current usage % as a plain number (e.g. `100.0`);
   with a number (`climax -p 85`) it sets the threshold instead.
 - `climax -t` — prints the targets that would be resumed/delegated, one per

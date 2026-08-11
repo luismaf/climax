@@ -235,11 +235,12 @@ struct RateInfo {
 // CLI
 // ─────────────────────────────────────────────
 const AFTER_HELP: &str = r#"MODES:
-  (no flags)         start the daemon AND print the status (default)
-  -z, --start        explicit daemon start (same as no flags): via the
-                     systemd service when installed, else in the foreground
+  (no flags)         start the daemon (installing the service first if it
+                     is missing) AND print the status (default)
+  -z, --start        explicit daemon start (same as no flags)
   -s, --status       read-only status (never starts the daemon)
-  -q, --stop         stop the daemon · --rehearsal  dry run (no effects)
+  -q, --stop         stop the daemon (the service, or the process; never
+                     uninstalls) · --rehearsal  dry run (no effects)
   --write-statusline Claude Code hook (stdin JSON -> cache) · --install/--uninstall service
   -d[=MSG] / -n      DELEGATION on (custom message) / off · -t <name> pin agent
   -a / -o            resume+delegate ALL claude agents / only the pin
@@ -292,16 +293,16 @@ struct Cli {
     #[arg(long = "rehearsal")]
     dry_run: bool,
 
-    /// Start the daemon (same as a bare `climax`): watches your quota
-    /// 24/7, warns before the block and auto-resumes at the reset. When
-    /// the systemd user service is installed it starts that service and
-    /// returns (no foreground loop); otherwise it prints the full status
-    /// and runs in the foreground.
+    /// Start the daemon (same as a bare `climax`): if the systemd user
+    /// service is not installed it is installed first, then started, and
+    /// the command returns (no foreground loop). Otherwise it prints the
+    /// full status and runs in the foreground.
     #[arg(short = 'z', long = "start")]
     start: bool,
 
     /// Stop the running climax daemon (the systemd user service when it is
-    /// installed, otherwise the daemon process). Prints the full status after.
+    /// installed, otherwise the daemon process). Never uninstalls the
+    /// service. Prints the full status after.
     #[arg(short = 'q', long = "stop")]
     stop: bool,
 
@@ -585,44 +586,63 @@ async fn main() -> Result<()> {
     }
 
     //
-    // If the systemd user service is installed, `climax` / `--start` hands
-    // the work to it and returns (the terminal is not occupied; the service
-    // runs the guard in the background). The service itself runs with
-    // --daemon-loop, so its process never delegates back to systemd.
-    // --rehearsal always stays foreground.
-    if !cli.dry_run && !cli.daemon_loop && user_systemd_dir().join(SERVICE_UNIT_NAME).exists() {
-        let was_active = is_service_active();
-        match run_systemctl(&["--user", "start", SERVICE_UNIT_NAME]) {
-            Ok(()) => {
-                // Only announce the start when it actually made a change
-                // (the service was down): if it was already running the
-                // message is just noise.
-                if !was_active {
-                    println!(
-                        "{}",
-                        painted(
-                            &format!(
-                                "Daemon started via systemd user service {}.",
-                                SERVICE_UNIT_NAME
-                            ),
-                            GREEN,
-                        )
-                    );
-                    println!();
+    // `climax` / `-z` / `--start` always end up with the systemd user
+    // service up: if the unit is missing it is installed first, then
+    // started, and the command returns (the terminal is not occupied).
+    // The service itself runs with --daemon-loop, so its process never
+    // delegates back to systemd. --rehearsal always stays foreground.
+    if !cli.dry_run && !cli.daemon_loop {
+        let unit_installed = user_systemd_dir().join(SERVICE_UNIT_NAME).exists();
+        if unit_installed {
+            let was_active = is_service_active();
+            match run_systemctl(&["--user", "start", SERVICE_UNIT_NAME]) {
+                Ok(()) => {
+                    // Only announce the start when it actually made a change
+                    // (the service was down): if it was already running the
+                    // message is just noise.
+                    if !was_active {
+                        println!(
+                            "{}",
+                            painted(
+                                &format!(
+                                    "Daemon started via systemd user service {}.",
+                                    SERVICE_UNIT_NAME
+                                ),
+                                GREEN,
+                            )
+                        );
+                        println!();
+                    }
+                    print_full_status(&config).await?;
+                    return Ok(());
                 }
-                print_full_status(&config).await?;
-                return Ok(());
+                Err(e) => warn!(
+                    "Could not start the systemd user service ({:#}); \
+                     running the daemon in the foreground instead.",
+                    e
+                ),
             }
-            Err(e) => warn!(
-                "Could not start the systemd user service ({:#}); \
-                 running the daemon in the foreground instead.",
-                e
-            ),
+        } else {
+            // Not installed yet: install it first, so a bare `climax` or
+            // `--start` leaves the guard running as a service, never as a
+            // hanging foreground process.
+            match install_service() {
+                Ok(()) => {
+                    print_full_status(&config).await?;
+                    return Ok(());
+                }
+                Err(e) => warn!(
+                    "Could not install the systemd user service ({:#}); \
+                     running the daemon in the foreground instead.",
+                    e
+                ),
+            }
         }
     }
 
-    // Foreground daemon (no service, or the service could not be started):
-    // report the full status first, then run the guard loop.
+    // Foreground daemon (--rehearsal, the service's own --daemon-loop
+    // process, or when systemd is unavailable): report the full status
+    // first, then run the guard loop.
     print_full_status(&config).await?;
     println!();
 
@@ -2270,6 +2290,21 @@ async fn print_full_status(config: &Config) -> Result<()> {
             painted(&format!("ON — {daemon_how}"), GREEN)
         } else {
             painted(&format!("OFF — {daemon_how}"), RED)
+        }
+    );
+    // Second line: is the systemd service installed or not (independent of
+    // whether it is currently running).
+    let unit_path = user_systemd_dir().join(SERVICE_UNIT_NAME);
+    println!(
+        "{:<15}: {}",
+        "service",
+        if unit_path.exists() {
+            painted(
+                &format!("installed ({})", unit_path.display()),
+                GREEN,
+            )
+        } else {
+            painted("not installed (bare `climax` or --start installs it)", YELLOW)
         }
     );
 
