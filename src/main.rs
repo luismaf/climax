@@ -2175,7 +2175,7 @@ fn daemon_status() -> bool {
         None
     };
     match systemd_state.as_deref() {
-        Some(s @ ("active" | "activating" | "reloading")) => true,
+        Some("active" | "activating" | "reloading") => true,
         Some(_) => climax_daemon_process().is_some(),
         None => climax_daemon_process().is_some(),
     }
